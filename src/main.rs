@@ -208,7 +208,7 @@ impl App {
         // largest size that actually fits THIS monitor's aspect ratio,
         // rather than a single fixed ratio that's oversized on ultrawide
         // screens and overflows on standard 16:9/16:10 ones.
-        let mut size = self.height as f32 * 0.44;
+        let mut size = self.height as f32 * 0.85;
         for _ in 0..2 {
             self.glyphs.clear();
             for c in "0123456789".chars() {
@@ -218,7 +218,7 @@ impl App {
             let card_width = 2.0 * digit_width + size * 0.02 + 2.0 * (size * 0.08);
             let total_width = 2.0 * card_width + size * 0.35;
 
-            let max_width = self.width as f32 * 0.94;
+            let max_width = self.width as f32 * 0.97;
             if total_width > max_width {
                 size *= max_width / total_width;
             } else {
@@ -380,17 +380,29 @@ impl App {
                     let (old_m, old_b) = &self.glyphs[&old_ch];
                     let (new_m, new_b) = &self.glyphs[&new_ch];
 
-                    if progress < 0.5 {
-                        // Eased (smoothstep) rather than linear, so the fold
-                        // decelerates into the hinge instead of snapping.
-                        let q = smoothstep(progress / 0.5);
+                    // Ease across the FULL 0..1 progress once, then split
+                    // the already-eased value into the two phases — not
+                    // two separate smoothstep(0..1) calls. smoothstep's
+                    // derivative is zero at both ends of whatever range you
+                    // give it, so easing each phase independently makes
+                    // the motion stop dead at the 50% mark (end of phase 1,
+                    // start of phase 2) and re-accelerate from rest right
+                    // after — a visible stutter at the hinge crossover on
+                    // every flip. Easing the whole span instead means
+                    // velocity is zero only at the true start/end of the
+                    // flip and fastest right through the middle, which is
+                    // one continuous motion with no pause.
+                    let eased = smoothstep(progress);
+
+                    if eased < 0.5 {
+                        let q = eased / 0.5;
                         // New top revealed underneath as the old top shrinks away.
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Top, 1.0, fg);
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Top, 1.0 - q, fg);
                         // Bottom hasn't started changing yet.
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0, fg);
                     } else {
-                        let q = smoothstep((progress - 0.5) / 0.5);
+                        let q = (eased - 0.5) / 0.5;
                         // Top settled onto its new value already.
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Top, 1.0, fg);
                         // New bottom grows in from the hinge, covering the old one.
