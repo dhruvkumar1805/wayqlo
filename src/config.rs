@@ -18,22 +18,18 @@ pub struct Config {
     /// on the desktop rather than digits floating in empty space.
     #[serde(deserialize_with = "deserialize_color")]
     pub card_color: (u8, u8, u8),
-    /// A signature color carried through the colon dots, the ambient
-    /// glow behind the clock, and a thin warm rim-light along each
-    /// card's bottom edge — this is what gives the piece an identity
-    /// instead of reading as generic monochrome grey-on-black.
-    #[serde(deserialize_with = "deserialize_color")]
-    pub accent_color: (u8, u8, u8),
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             hour_format: HourFormat::TwentyFour,
-            digit_color: (0xFF, 0xFF, 0xFF),
+            // A soft, slightly warm grey rather than pure white — this is
+            // the tone real Fliqlo actually uses; pure white read as too
+            // stark/clinical against the dark card.
+            digit_color: (0xB8, 0xB8, 0xB8),
             background_color: (0x00, 0x00, 0x00),
             card_color: (0x16, 0x16, 0x16),
-            accent_color: (0xFF, 0x8A, 0x4C),
         }
     }
 }

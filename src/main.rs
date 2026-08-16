@@ -52,6 +52,15 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/Oswald-Bold.ttf");
 // How long a single digit's flip animation takes, start to finish.
 const FLIP_DURATION: Duration = Duration::from_millis(350);
 
+// Even Oswald's condensed proportions leave the clock a bit short of a
+// screen's full height on standard 16:9 monitors (we're still width-bound
+// before height runs out). A MILD additional horizontal squeeze closes
+// that gap — unlike the earlier 0.62 squeeze on Inter ExtraBold (which
+// was forcing a wide, non-condensed face to be dramatically narrower and
+// visibly distorted its strokes), this is a small nudge on top of a face
+// that's already properly condensed, so it stays clean at this ratio.
+const DIGIT_SQUEEZE: f32 = 0.85;
+
 // Index into the formatted "HH:MM" time string for each of our 4 digit
 // slots (H, H, M, M) — index 2 (the ':') is skipped since it's drawn
 // separately as two static dots, not a digit slot.
@@ -107,7 +116,6 @@ fn main() {
         digit_color: config.digit_color,
         background_color: config.background_color,
         card_color: config.card_color,
-        accent_color: config.accent_color,
         width: 0,
         height: 0,
         first_configure: true,
@@ -122,8 +130,7 @@ fn main() {
         card_rects: [(0, 0, 0, 0); 2],
         card_radius: 0,
         hinge_band: 0,
-        colon_dots: [(0, 0); 2],
-        dot_radius: 0,
+        shadow_offset: 0,
         slots: std::array::from_fn(|i| DigitSlot { current: now_chars[DIGIT_POS[i]], anim: None }),
     };
 
@@ -174,7 +181,6 @@ struct App {
     digit_color: (u8, u8, u8),
     background_color: (u8, u8, u8),
     card_color: (u8, u8, u8),
-    accent_color: (u8, u8, u8),
     width: u32,
     height: u32,
     first_configure: bool,
@@ -198,9 +204,8 @@ struct App {
     card_radius: i32,
     // How many pixels above/below the hinge the fold shadow fades out over.
     hinge_band: i32,
-    // Center of each of the 2 colon dots.
-    colon_dots: [(i32, i32); 2],
-    dot_radius: i32,
+    // Offset (both x and y) for the settled-digit drop shadow.
+    shadow_offset: i32,
 
     slots: [DigitSlot; 4],
 }
@@ -221,11 +226,11 @@ impl App {
             for c in "0123456789".chars() {
                 self.glyphs.insert(c, self.font.rasterize(c, size));
             }
-            let digit_width = self.glyphs[&'0'].0.advance_width;
-            let card_width = 2.0 * digit_width + size * 0.02 + 2.0 * (size * 0.04);
-            let total_width = 2.0 * card_width + size * 0.22;
+            let digit_width = self.glyphs[&'0'].0.advance_width * DIGIT_SQUEEZE;
+            let card_width = 2.0 * digit_width + size * 0.015 + 2.0 * (size * 0.03);
+            let total_width = 2.0 * card_width + size * 0.18;
 
-            let max_width = self.width as f32 * 0.96;
+            let max_width = self.width as f32 * 0.99;
             if total_width > max_width {
                 size *= max_width / total_width;
             } else {
@@ -234,13 +239,13 @@ impl App {
         }
 
         let digit = &self.glyphs[&'0'].0;
-        let digit_width = digit.advance_width;
+        let digit_width = digit.advance_width * DIGIT_SQUEEZE;
         let glyph_height = digit.height as f32;
 
-        let card_padding_x = size * 0.04;
+        let card_padding_x = size * 0.03;
         let card_padding_y = size * 0.05;
-        let digit_gap = size * 0.02;
-        let pair_gap = size * 0.22;
+        let digit_gap = size * 0.015;
+        let pair_gap = size * 0.18;
 
         let card_width = 2.0 * digit_width + digit_gap + 2.0 * card_padding_x;
         let half_card_height = (glyph_height / 2.0 + card_padding_y).round() as i32;
@@ -274,13 +279,10 @@ impl App {
         let card_bottom = self.hinge_y + half_card_height;
         self.card_rects[0] = (hour_x0 as i32, card_top, hour_x1 as i32, card_bottom);
         self.card_rects[1] = (minute_x0 as i32, card_top, minute_x1 as i32, card_bottom);
-        self.card_radius = (size * 0.06).round() as i32;
+        self.card_radius = (size * 0.08).round() as i32;
         self.hinge_band = ((size * 0.06).round() as i32).max(2);
 
-        self.dot_radius = (size * 0.035).round() as i32;
-        let dot_spacing = (size * 0.15).round() as i32;
-        let colon_x = ((hour_x1 + minute_x0) / 2.0).round() as i32;
-        self.colon_dots = [(colon_x, self.hinge_y - dot_spacing), (colon_x, self.hinge_y + dot_spacing)];
+        self.shadow_offset = (size * 0.012).round().max(1.0) as i32;
     }
 
     /// Checks the real clock and starts/advances/settles any flip
@@ -330,9 +332,20 @@ impl App {
         });
 
         // The two card panels sit behind everything else — digits and the
-        // hinge shadow both draw on top of them.
+        // hinge shadow both draw on top of them. A hairline border (a
+        // slightly lighter ring, drawn first and then inset by the fill)
+        // gives each card a precise, "engineered object" edge instead of
+        // just fading straight into the black background.
+        let border_color = (
+            (self.card_color.0 as u16 + 14).min(255) as u8,
+            (self.card_color.1 as u16 + 14).min(255) as u8,
+            (self.card_color.2 as u16 + 14).min(255) as u8,
+        );
         for &(x0, y0, x1, y1) in &self.card_rects {
-            fill_rounded_rect(canvas, width, height, x0, y0, x1, y1, self.card_radius, self.card_color);
+            fill_rounded_rect(canvas, width, height, x0, y0, x1, y1, self.card_radius, border_color);
+        }
+        for &(x0, y0, x1, y1) in &self.card_rects {
+            fill_rounded_rect(canvas, width, height, x0 + 1, y0 + 1, x1 - 1, y1 - 1, (self.card_radius - 1).max(0), self.card_color);
         }
 
         // A subtle film-grain texture on each card — a flat vector fill
@@ -363,22 +376,6 @@ impl App {
             }
         }
 
-        // A thin warm rim-light along each card's bottom edge, in the
-        // accent color — the counterpart to the cool white top highlight,
-        // as if the card is catching warm reflected light from below.
-        for &(x0, _, x1, y1) in &self.card_rects {
-            let y = y1 - 2;
-            if y < 0 || y as u32 >= height {
-                continue;
-            }
-            for x in (x0 + self.card_radius).max(0)..(x1 - self.card_radius).min(width as i32) {
-                let idx = (y as u32 * width + x as u32) as usize * 4;
-                canvas[idx] = lerp_u8(canvas[idx], self.accent_color.2, 0.3);
-                canvas[idx + 1] = lerp_u8(canvas[idx + 1], self.accent_color.1, 0.3);
-                canvas[idx + 2] = lerp_u8(canvas[idx + 2], self.accent_color.0, 0.3);
-            }
-        }
-
         // A soft fold shadow at each card's hinge, instead of a hard line —
         // darkens a small band that fades out above and below the hinge.
         // Drawn BEFORE the digits (not after) so it only affects the card
@@ -399,6 +396,13 @@ impl App {
             match slot.anim {
                 None => {
                     let (m, b) = &self.glyphs[&slot.current];
+                    // A soft offset shadow under the settled digit — gives
+                    // the typography actual lift off the card surface
+                    // instead of looking pasted flat onto it. Skipped
+                    // during an active flip (the fast motion there hides
+                    // its absence, and it'd need to follow both halves
+                    // through the animation for little visible benefit).
+                    draw_glyph_shadow(canvas, width, height, pen_x, self.baseline, m, b, self.shadow_offset, 0.35);
                     draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Top, 1.0, fg);
                     draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Bottom, 1.0, fg);
                 }
@@ -441,13 +445,6 @@ impl App {
             }
         }
 
-        // The colon: two accent-colored dots, each with a small pilot-light
-        // glow, in the black gap between the cards.
-        for &(cx, cy) in &self.colon_dots {
-            draw_radial_glow(canvas, width, height, cx as f32, cy as f32, self.dot_radius as f32 * 3.0, self.accent_color, 0.5);
-            fill_circle(canvas, width, height, cx, cy, self.dot_radius, self.accent_color);
-        }
-
         self.layer.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
         buffer.attach_to(self.layer.wl_surface()).expect("attach buffer");
 
@@ -478,6 +475,41 @@ fn smoothstep(t: f32) -> f32 {
 enum Half {
     Top,
     Bottom,
+}
+
+/// Draws a soft, offset silhouette of a full (unsplit, unscaled) glyph at
+/// reduced opacity — a simple drop shadow that gives settled typography a
+/// bit of lift off the card surface instead of looking pasted flat onto
+/// it. Unlike draw_glyph_half, this always draws the complete glyph (no
+/// hinge split) since it's only used for non-animating digits.
+#[allow(clippy::too_many_arguments)]
+fn draw_glyph_shadow(canvas: &mut [u8], width: u32, height: u32, pen_x: f32, baseline: f32, metrics: &fontdue::Metrics, bitmap: &[u8], offset: i32, opacity: f32) {
+    for y in 0..metrics.height {
+        let canvas_y = baseline as i32 - metrics.ymin - metrics.height as i32 + y as i32 + offset;
+        if canvas_y < 0 || canvas_y as u32 >= height {
+            continue;
+        }
+        let squeezed_width = ((metrics.width as f32) * DIGIT_SQUEEZE).ceil() as i32;
+        for ox in 0..squeezed_width {
+            let src_x = (ox as f32 / DIGIT_SQUEEZE).round() as usize;
+            if src_x >= metrics.width {
+                continue;
+            }
+            let coverage = bitmap[y * metrics.width + src_x];
+            if coverage == 0 {
+                continue;
+            }
+            let px = pen_x as i32 + (metrics.xmin as f32 * DIGIT_SQUEEZE).round() as i32 + ox + offset;
+            if px < 0 || px as u32 >= width {
+                continue;
+            }
+            let idx = (canvas_y as u32 * width + px as u32) as usize * 4;
+            let t = (coverage as f32 / 255.0) * opacity;
+            canvas[idx] = lerp_u8(canvas[idx], 0, t);
+            canvas[idx + 1] = lerp_u8(canvas[idx + 1], 0, t);
+            canvas[idx + 2] = lerp_u8(canvas[idx + 2], 0, t);
+        }
+    }
 }
 
 /// Draws one half (top or bottom, split at `hinge_y`) of a rasterized
@@ -543,12 +575,17 @@ fn draw_glyph_half(
             continue;
         }
 
-        for x in 0..metrics.width {
-            let coverage = bitmap[src_row as usize * metrics.width + x];
+        let squeezed_width = ((metrics.width as f32) * DIGIT_SQUEEZE).ceil() as i32;
+        for ox in 0..squeezed_width {
+            let src_x = (ox as f32 / DIGIT_SQUEEZE).round() as usize;
+            if src_x >= metrics.width {
+                continue;
+            }
+            let coverage = bitmap[src_row as usize * metrics.width + src_x];
             if coverage == 0 {
                 continue;
             }
-            let px = pen_x as i32 + metrics.xmin + x as i32;
+            let px = pen_x as i32 + (metrics.xmin as f32 * DIGIT_SQUEEZE).round() as i32 + ox;
             if px < 0 || px as u32 >= width {
                 continue;
             }
@@ -596,24 +633,6 @@ fn fill_rounded_rect(canvas: &mut [u8], width: u32, height: u32, x0: i32, y0: i3
     }
 }
 
-/// Fills a filled circle — used for the colon dots.
-fn fill_circle(canvas: &mut [u8], width: u32, height: u32, cx: i32, cy: i32, radius: i32, color: (u8, u8, u8)) {
-    for y in (cy - radius).max(0)..(cy + radius + 1).min(height as i32) {
-        for x in (cx - radius).max(0)..(cx + radius + 1).min(width as i32) {
-            let dx = x - cx;
-            let dy = y - cy;
-            if dx * dx + dy * dy > radius * radius {
-                continue;
-            }
-            let idx = (y as u32 * width + x as u32) as usize * 4;
-            canvas[idx] = color.2;
-            canvas[idx + 1] = color.1;
-            canvas[idx + 2] = color.0;
-            canvas[idx + 3] = 0xFF;
-        }
-    }
-}
-
 /// Darkens a band of `canvas` around `hinge_y` (within x0..x1), fading out
 /// toward the edges of the band — a soft fold shadow instead of a hard
 /// line, drawn on top of whatever's already there (card + digits).
@@ -630,43 +649,6 @@ fn draw_hinge_shadow(canvas: &mut [u8], width: u32, height: u32, x0: i32, x1: i3
             canvas[idx] = (canvas[idx] as f32 * (1.0 - darken)) as u8;
             canvas[idx + 1] = (canvas[idx + 1] as f32 * (1.0 - darken)) as u8;
             canvas[idx + 2] = (canvas[idx + 2] as f32 * (1.0 - darken)) as u8;
-        }
-    }
-}
-
-/// Blends `color` into a soft circular falloff centered at (cx, cy):
-/// strongest at the center (`peak` is the max blend amount, 0..1) fading to
-/// nothing at `radius`. Used for the ambient glow behind the clock and the
-/// small pilot-light glow behind each colon dot — a light source is the
-/// single easiest way to make a flat 2D scene stop looking flat.
-fn draw_radial_glow(canvas: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, radius: f32, color: (u8, u8, u8), peak: f32) {
-    if radius <= 0.0 {
-        return;
-    }
-    let x0 = (cx - radius).floor().max(0.0) as i32;
-    let x1 = (cx + radius).ceil().min(width as f32) as i32;
-    let y0 = (cy - radius).floor().max(0.0) as i32;
-    let y1 = (cy + radius).ceil().min(height as f32) as i32;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            let dist = (dx * dx + dy * dy).sqrt();
-            if dist > radius {
-                continue;
-            }
-            // Quadratic falloff reads as a softer, more natural glow than
-            // a linear fade — most of the brightness stays near the
-            // center instead of ramping evenly all the way to the edge.
-            let t = 1.0 - dist / radius;
-            let alpha = peak * t * t;
-            if alpha <= 0.0 {
-                continue;
-            }
-            let idx = (y as u32 * width + x as u32) as usize * 4;
-            canvas[idx] = lerp_u8(canvas[idx], color.2, alpha);
-            canvas[idx + 1] = lerp_u8(canvas[idx + 1], color.1, alpha);
-            canvas[idx + 2] = lerp_u8(canvas[idx + 2], color.0, alpha);
         }
     }
 }
