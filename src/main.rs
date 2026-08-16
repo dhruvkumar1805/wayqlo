@@ -57,8 +57,8 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/NimbusSansNarrow-Bold.otf");
 const FLIP_DURATION: Duration = Duration::from_millis(260);
 
 // Index into the formatted "HH:MM" time string for each of our 4 digit
-// slots (H, H, M, M) — index 2 (the ':') is skipped since it's drawn
-// separately as two static dots, not a digit slot.
+// slots (H, H, M, M): index 2 (the ':') is simply skipped, not a digit slot.
+// The gap between the two cards stands in for the colon.
 const DIGIT_POS: [usize; 4] = [0, 1, 3, 4];
 
 fn main() {
@@ -75,7 +75,7 @@ fn main() {
     let font = fontdue::Font::from_bytes(FONT_DATA, fontdue::FontSettings::default())
         .expect("failed to parse bundled font");
 
-    let time_format = config.hour_format.strftime();
+    let show_meridiem = config.hour_format.shows_meridiem();
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -86,7 +86,8 @@ fn main() {
         shm,
         qh: qh.clone(),
         font,
-        time_format,
+        hour_format: config.hour_format,
+        show_meridiem,
         digit_color: config.digit_color,
         background_color: config.background_color,
         card_color: config.card_color,
@@ -118,7 +119,7 @@ fn main() {
     // often as the compositor is ready to show a new frame.
     loop_handle
         .insert_source(Timer::immediate(), |_deadline, _, app| {
-            let now_chars: Vec<char> = chrono::Local::now().format(app.time_format).to_string().chars().collect();
+            let now_chars: Vec<char> = app.hour_format.format_now().chars().collect();
             for output in &mut app.outputs {
                 // Guard against firing before the first `configure` event
                 // has arrived (width/height still 0, glyph cache still
@@ -164,7 +165,8 @@ struct App {
     shm: Shm,
     qh: QueueHandle<App>,
     font: fontdue::Font,
-    time_format: &'static str,
+    hour_format: config::HourFormat,
+    show_meridiem: bool,
     digit_color: (u8, u8, u8),
     background_color: (u8, u8, u8),
     card_color: (u8, u8, u8),
@@ -205,6 +207,12 @@ struct OutputSurface {
     // Precomputed, fixed x position for each of the 4 digit slots, so
     // digits don't jitter horizontally as they change width.
     slot_x: [f32; 4],
+    // Horizontal midpoint of the hour card. In 12-hour mode with a
+    // single-digit hour, the tens flap is blank and the ones digit is
+    // re-centered on this instead of sitting at its paired-digit slot_x,
+    // matching how a real single-digit flip-clock card reads: one digit
+    // in the middle, not shoved into a two-digit layout's second slot.
+    hour_center: f32,
     baseline: f32,
     hinge_y: i32,
     // (x0, y0, x1, y1) for the hour-pair card and the minute-pair card.
@@ -212,10 +220,18 @@ struct OutputSurface {
     card_radius: i32,
 
     slots: [DigitSlot; 4],
+
+    // AM/PM indicator, shown in the bottom-left corner of the hour card
+    // in 12-hour mode only. `None` in 24-hour mode, where the hour alone
+    // already disambiguates and there's nothing to draw.
+    show_meridiem: bool,
+    label_glyphs: HashMap<char, (fontdue::Metrics, Vec<u8>)>,
+    label_x: f32,
+    label_baseline: f32,
 }
 
 impl OutputSurface {
-    fn new(wl_output: wl_output::WlOutput, layer: LayerSurface, pool: SlotPool, now_chars: &[char]) -> Self {
+    fn new(wl_output: wl_output::WlOutput, layer: LayerSurface, pool: SlotPool, now_chars: &[char], show_meridiem: bool) -> Self {
         OutputSurface {
             wl_output,
             layer,
@@ -226,11 +242,16 @@ impl OutputSurface {
             animating: false,
             glyphs: HashMap::new(),
             slot_x: [0.0; 4],
+            hour_center: 0.0,
             baseline: 0.0,
             hinge_y: 0,
             card_rects: [(0, 0, 0, 0); 2],
             card_radius: 0,
             slots: std::array::from_fn(|i| DigitSlot::new(now_chars[DIGIT_POS[i]])),
+            show_meridiem,
+            label_glyphs: HashMap::new(),
+            label_x: 0.0,
+            label_baseline: 0.0,
         }
     }
 
@@ -257,7 +278,12 @@ impl OutputSurface {
         let mut size = rectsize;
         for _ in 0..2 {
             self.glyphs.clear();
-            for c in "0123456789".chars() {
+            // ' ' is included so a blank tens-flap (single-digit 12-hour
+            // hour) is just another cached glyph: fontdue rasterizes it
+            // to an empty bitmap, which the draw functions already treat
+            // as "nothing to paint," so the blank flap needs no special
+            // casing anywhere else.
+            for c in "0123456789 ".chars() {
                 self.glyphs.insert(c, font.rasterize(c, size));
             }
             let digit_width = self.glyphs[&'0'].0.advance_width;
@@ -291,6 +317,7 @@ impl OutputSurface {
         self.slot_x[1] = hour_center + digit_gap / 2.0;
         self.slot_x[2] = minute_center - digit_width - digit_gap / 2.0;
         self.slot_x[3] = minute_center + digit_gap / 2.0;
+        self.hour_center = hour_center;
 
         self.hinge_y = self.height as i32 / 2;
         // Center the glyph's actual vertical midpoint on the hinge, using
@@ -303,6 +330,30 @@ impl OutputSurface {
 
         self.card_rects[0] = (hour_x0 as i32, start_y as i32, hour_x1 as i32, (start_y + rectsize) as i32);
         self.card_rects[1] = (minute_x0 as i32, start_y as i32, minute_x1 as i32, (start_y + rectsize) as i32);
+
+        if self.show_meridiem {
+            let label_size = rectsize * 0.12;
+            self.label_glyphs.clear();
+            for c in "AMP".chars() {
+                self.label_glyphs.insert(c, font.rasterize(c, label_size));
+            }
+            // Anchor below the digit's own actual bottom edge (half the
+            // glyph height under the hinge), not a fixed fraction of the
+            // card: a card-relative offset alone doesn't know how tall
+            // the digit glyphs ended up and can land the label baseline
+            // above where the digit already ends, overlapping it.
+            let digit_bottom = self.hinge_y as f32 + glyph_height / 2.0;
+            let label_ascent = self
+                .label_glyphs
+                .values()
+                .map(|(m, _)| m.height as i32 + m.ymin)
+                .max()
+                .unwrap_or(0) as f32;
+            let gap = rectsize * 0.035;
+            let bottom_padding = rectsize * 0.06;
+            self.label_x = hour_x0 + rectsize * 0.08;
+            self.label_baseline = (digit_bottom + gap + label_ascent).min(start_y + rectsize - bottom_padding);
+        }
     }
 
     /// Checks the real clock and starts/advances/settles any flip
@@ -364,16 +415,31 @@ impl OutputSurface {
 
         let fg = digit_color;
         for i in 0..4 {
-            let pen_x = self.slot_x[i];
             let slot = &self.slots[i];
 
             match slot.anim {
                 None => {
                     let (m, b) = &self.glyphs[&slot.current];
+                    // A single-digit 12-hour hour (blank tens flap) reads
+                    // as one digit sitting in a two-digit slot otherwise:
+                    // pulled off-center toward where the ones digit
+                    // normally pairs with a tens digit. Re-center it on
+                    // the card using this glyph's own ink bounds instead.
+                    let pen_x = if i == 1 && self.slots[0].current == ' ' {
+                        self.hour_center - (m.xmin as f32 + m.width as f32 / 2.0)
+                    } else {
+                        self.slot_x[i]
+                    };
                     draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Top, 1.0, fg);
                     draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Bottom, 1.0, fg);
                 }
                 Some((new_ch, start)) => {
+                    // Mid-flip, the hour ones digit stays at its normal
+                    // paired position rather than re-centering: that only
+                    // happens twice a day (around the 9/10 and 12/1
+                    // boundaries) and settles into the right spot the
+                    // instant the flip completes.
+                    let pen_x = self.slot_x[i];
                     let progress = (start.elapsed().as_secs_f32() / FLIP_DURATION.as_secs_f32()).min(1.0);
                     let old_ch = slot.current;
                     let (old_m, old_b) = &self.glyphs[&old_ch];
@@ -408,6 +474,17 @@ impl OutputSurface {
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0, fg);
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Bottom, q, fg);
                     }
+                }
+            }
+        }
+
+        if self.show_meridiem {
+            let meridiem = chrono::Local::now().format("%p").to_string();
+            let mut pen_x = self.label_x;
+            for c in meridiem.chars() {
+                if let Some((m, b)) = self.label_glyphs.get(&c) {
+                    draw_glyph(canvas, width, height, pen_x, self.label_baseline, m, b, fg);
+                    pen_x += m.advance_width;
                 }
             }
         }
@@ -534,6 +611,38 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
+/// Draws a whole rasterized glyph at full size, no hinge split. Used for
+/// the small AM/PM label, which doesn't flip.
+fn draw_glyph(canvas: &mut [u8], width: u32, height: u32, pen_x: f32, baseline: f32, metrics: &fontdue::Metrics, bitmap: &[u8], fg: (u8, u8, u8)) {
+    if metrics.width == 0 || metrics.height == 0 {
+        return;
+    }
+
+    let top = baseline as i32 - metrics.ymin - metrics.height as i32;
+    for row in 0..metrics.height {
+        let canvas_y = top + row as i32;
+        if canvas_y < 0 || canvas_y as u32 >= height {
+            continue;
+        }
+        for x in 0..metrics.width {
+            let coverage = bitmap[row * metrics.width + x];
+            if coverage == 0 {
+                continue;
+            }
+            let px = pen_x as i32 + metrics.xmin + x as i32;
+            if px < 0 || px as u32 >= width {
+                continue;
+            }
+            let idx = (canvas_y as u32 * width + px as u32) as usize * 4;
+            let t = coverage as f32 / 255.0;
+            canvas[idx] = lerp_u8(canvas[idx], fg.2, t);
+            canvas[idx + 1] = lerp_u8(canvas[idx + 1], fg.1, t);
+            canvas[idx + 2] = lerp_u8(canvas[idx + 2], fg.0, t);
+            canvas[idx + 3] = 0xFF;
+        }
+    }
+}
+
 /// Fills an axis-aligned rectangle with rounded corners. Standard
 /// "clamp to nearest corner center, test distance" technique: pixels in
 /// the straight top/bottom/left/right bands always pass (clamping puts the
@@ -605,7 +714,7 @@ impl CompositorHandler for App {
         // redraw. draw() itself will ask for another frame callback if
         // still animating afterward, keeping this loop going at the
         // compositor's own pace.
-        let now_chars: Vec<char> = chrono::Local::now().format(self.time_format).to_string().chars().collect();
+        let now_chars: Vec<char> = self.hour_format.format_now().chars().collect();
         let (digit_color, background_color, card_color) = (self.digit_color, self.background_color, self.card_color);
         let qh = self.qh.clone();
         if let Some(output) = self.output_surface_for(surface) {
@@ -645,8 +754,8 @@ impl OutputHandler for App {
 
         let pool = SlotPool::new(1, &self.shm).expect("failed to create shm pool");
 
-        let now_chars: Vec<char> = chrono::Local::now().format(self.time_format).to_string().chars().collect();
-        self.outputs.push(OutputSurface::new(wl_output, layer, pool, &now_chars));
+        let now_chars: Vec<char> = self.hour_format.format_now().chars().collect();
+        self.outputs.push(OutputSurface::new(wl_output, layer, pool, &now_chars, self.show_meridiem));
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}

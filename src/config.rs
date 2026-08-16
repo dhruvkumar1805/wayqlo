@@ -24,10 +24,10 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             hour_format: HourFormat::TwentyFour,
-            // A soft, warm grey rather than pure white. Flip clocks
-            // traditionally print digits in a muted grey ink, not stark
-            // white, and it reads as calmer against the dark card.
-            digit_color: (0xB7, 0xB7, 0xB7),
+            // A cool, pale ice-blue rather than neutral grey or stark
+            // white: it reads like a backlit LCD panel rather than
+            // printed ink.
+            digit_color: (0xDC, 0xE8, 0xF5),
             background_color: (0x00, 0x00, 0x00),
             card_color: (0x0F, 0x0F, 0x0F),
         }
@@ -43,14 +43,30 @@ pub enum HourFormat {
 }
 
 impl HourFormat {
-    /// The chrono format string for this hour style. Always 2-digit hour +
-    /// 2-digit minute — our layout has 5 fixed character slots (H H : M M)
-    /// and can't yet support a variable-width string.
-    pub fn strftime(self) -> &'static str {
+    /// Formats the current time as exactly 5 characters (H H : M M), which
+    /// is what the fixed 4-digit-slot layout requires.
+    ///
+    /// In 12-hour mode the hour is space-padded rather than zero-padded (a
+    /// lone "7", not "07"): real flip clocks with a two-flap hour card
+    /// leave the tens flap blank rather than printing a leading zero, and
+    /// a space character rasterizes to an empty glyph, so the blank flap
+    /// falls out of the normal digit-rendering path for free.
+    pub fn format_now(self) -> String {
+        let now = chrono::Local::now();
         match self {
-            HourFormat::Twelve => "%I:%M",
-            HourFormat::TwentyFour => "%H:%M",
+            HourFormat::TwentyFour => now.format("%H:%M").to_string(),
+            HourFormat::Twelve => {
+                let hour12: u32 = now.format("%I").to_string().parse().expect("chrono %I is always numeric");
+                format!("{hour12:2}:{}", now.format("%M"))
+            }
         }
+    }
+
+    /// Whether an AM/PM indicator should be shown alongside the clock.
+    /// Meaningless (and skipped) in 24-hour mode, where the hour alone
+    /// already disambiguates.
+    pub fn shows_meridiem(self) -> bool {
+        matches!(self, HourFormat::Twelve)
     }
 }
 

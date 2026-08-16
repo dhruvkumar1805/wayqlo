@@ -53,7 +53,7 @@ out falls back to its default. See `contrib/config.toml` for a full example.
 | Field               | Default     | Description                    |
 | ------------------- | ----------- | ------------------------------ |
 | `hour_format`        | `"24"`      | `"12"` or `"24"`               |
-| `digit_color`        | `"#B7B7B7"` | Digit color, as `#RRGGBB`      |
+| `digit_color`        | `"#DCE8F5"` | Digit color, as `#RRGGBB`      |
 | `background_color`   | `"#000000"` | Screen background color        |
 | `card_color`         | `"#0F0F0F"` | Flip card panel color          |
 
