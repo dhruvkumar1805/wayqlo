@@ -1,0 +1,12 @@
+Nimbus Sans Narrow (Bold)
+Part of the URW++ "Base 35" font set, distributed via the gsfonts
+package (Arch Linux) / Ghostscript.
+
+Upstream project: https://github.com/ArtifexSoftware/urw-base35-fonts
+
+License: AGPL-3.0-only WITH PS-or-PDF-font-exception-20170817
+
+The PS/PDF font exception permits embedding this font in documents and
+software output without the embedding application itself being subject
+to AGPL. Full license text: https://www.gnu.org/licenses/agpl-3.0.html
+and https://spdx.org/licenses/PS-or-PDF-font-exception-20170817.html

@@ -36,30 +36,23 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-// Oswald Bold (OFL-1.1 licensed, see assets/Oswald-LICENSE.txt), baked
+// Nimbus Sans Narrow Bold (AGPL-3.0 with the standard PS/PDF font
+// embedding exception — see assets/NimbusSansNarrow-LICENSE.txt), baked
 // directly into the binary at compile time via include_bytes!. No runtime
 // filesystem dependency on a specific font package being installed — the
-// executable is fully self-contained. Oswald is a genuinely condensed
-// typeface by design (unlike our first attempt, Inter ExtraBold, which we
-// tried to force-narrow with a horizontal scale hack — that just made the
-// strokes look unevenly stretched, since squeezing only one axis distorts
-// a typeface that wasn't designed for it). A real condensed face keeps its
-// stroke proportions consistent while still being narrow enough that 4
-// digits comfortably fit a 16:9 screen's width with plenty of height to
-// spare — which is what actually lets the clock get big like real Fliqlo.
-const FONT_DATA: &[u8] = include_bytes!("../assets/Oswald-Bold.ttf");
+// executable is fully self-contained.
+//
+// This is a proper condensed-bold grotesque in the Helvetica/Neue
+// Helvetica family, which is the typeface family flip-clock displays
+// traditionally use — earlier attempts (a wide face force-narrowed with a
+// horizontal scale hack, then a generic condensed face like Oswald) were
+// both the wrong typeface family entirely, not just a proportions problem;
+// scaling distorts strokes unevenly, and a different family's letterforms
+// just read as visually "off" even at the right width.
+const FONT_DATA: &[u8] = include_bytes!("../assets/NimbusSansNarrow-Bold.otf");
 
 // How long a single digit's flip animation takes, start to finish.
 const FLIP_DURATION: Duration = Duration::from_millis(260);
-
-// Even Oswald's condensed proportions leave the clock a bit short of a
-// screen's full height on standard 16:9 monitors (we're still width-bound
-// before height runs out). A MILD additional horizontal squeeze closes
-// that gap — unlike the earlier 0.62 squeeze on Inter ExtraBold (which
-// was forcing a wide, non-condensed face to be dramatically narrower and
-// visibly distorted its strokes), this is a small nudge on top of a face
-// that's already properly condensed, so it stays clean at this ratio.
-const DIGIT_SQUEEZE: f32 = 0.85;
 
 // Index into the formatted "HH:MM" time string for each of our 4 digit
 // slots (H, H, M, M) — index 2 (the ':') is skipped since it's drawn
@@ -233,7 +226,7 @@ impl App {
             for c in "0123456789".chars() {
                 self.glyphs.insert(c, self.font.rasterize(c, size));
             }
-            let digit_width = self.glyphs[&'0'].0.advance_width * DIGIT_SQUEEZE;
+            let digit_width = self.glyphs[&'0'].0.advance_width;
             let inner_width = 2.0 * digit_width + size * 0.02;
             let max_inner_width = rectsize * 0.88;
             if inner_width > max_inner_width {
@@ -244,7 +237,7 @@ impl App {
         }
 
         let digit = &self.glyphs[&'0'].0;
-        let digit_width = digit.advance_width * DIGIT_SQUEEZE;
+        let digit_width = digit.advance_width;
         let glyph_height = digit.height as f32;
         let digit_gap = size * 0.02;
 
@@ -484,17 +477,12 @@ fn draw_glyph_half(
             continue;
         }
 
-        let squeezed_width = ((metrics.width as f32) * DIGIT_SQUEEZE).ceil() as i32;
-        for ox in 0..squeezed_width {
-            let src_x = (ox as f32 / DIGIT_SQUEEZE).round() as usize;
-            if src_x >= metrics.width {
-                continue;
-            }
-            let coverage = bitmap[src_row as usize * metrics.width + src_x];
+        for x in 0..metrics.width {
+            let coverage = bitmap[src_row as usize * metrics.width + x];
             if coverage == 0 {
                 continue;
             }
-            let px = pen_x as i32 + (metrics.xmin as f32 * DIGIT_SQUEEZE).round() as i32 + ox;
+            let px = pen_x as i32 + metrics.xmin + x as i32;
             if px < 0 || px as u32 >= width {
                 continue;
             }
