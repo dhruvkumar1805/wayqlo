@@ -6,5 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.45"
 fontdue = "0.9.4"
+serde = { version = "1.0.229", features = ["derive"] }
 smithay-client-toolkit = "0.21.1"
+toml = "1.1.4"
 wayland-client = "0.31.15"

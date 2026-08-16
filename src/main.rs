@@ -1,3 +1,5 @@
+mod config;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -14,6 +16,11 @@ use smithay_client_toolkit::{
     },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        Capability, SeatHandler, SeatState,
+    },
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -25,7 +32,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
 
@@ -37,6 +44,8 @@ const FONT_PATH: &str = "/usr/share/fonts/noto/NotoSans-Bold.ttf";
 const FLIP_DURATION: Duration = Duration::from_millis(350);
 
 fn main() {
+    let config = config::load();
+
     let conn = Connection::connect_to_env().expect("failed to connect to Wayland compositor");
     let (globals, event_queue) = registry_queue_init(&conn).unwrap();
     let qh = event_queue.handle();
@@ -50,7 +59,10 @@ fn main() {
 
     layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
     layer.set_exclusive_zone(-1);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    // Exclusive (not OnDemand): grab keyboard focus the moment we're shown,
+    // rather than waiting for the user to click into us first. A
+    // screensaver-style overlay should react to the very first keypress.
+    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
     layer.commit();
 
     let pool = SlotPool::new(1, &shm).expect("failed to create shm pool");
@@ -66,21 +78,28 @@ fn main() {
         .insert(loop_handle.clone())
         .expect("failed to insert wayland source");
 
-    let now_chars: Vec<char> = chrono::Local::now().format("%H:%M").to_string().chars().collect();
+    let time_format = config.hour_format.strftime();
+    let now_chars: Vec<char> = chrono::Local::now().format(time_format).to_string().chars().collect();
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
         shm,
         pool,
         layer,
         qh: qh.clone(),
         font,
+        time_format,
+        digit_color: config.digit_color,
+        background_color: config.background_color,
         width: 0,
         height: 0,
         first_configure: true,
         exit: false,
         animating: false,
+        keyboard: None,
+        pointer: None,
         glyphs: HashMap::new(),
         slot_x: [0.0; 5],
         baseline: 0.0,
@@ -125,11 +144,15 @@ struct DigitSlot {
 struct App {
     registry_state: RegistryState,
     output_state: OutputState,
+    seat_state: SeatState,
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
     qh: QueueHandle<App>,
     font: fontdue::Font,
+    time_format: &'static str,
+    digit_color: (u8, u8, u8),
+    background_color: (u8, u8, u8),
     width: u32,
     height: u32,
     first_configure: bool,
@@ -137,6 +160,8 @@ struct App {
     // True while any digit slot is mid-flip. While true, redraws are paced
     // by frame callbacks instead of the idle-poll timer.
     animating: bool,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
 
     // Cache of rasterized glyphs for '0'..'9' and ':', keyed by character,
     // computed once per screen size instead of every frame.
@@ -184,7 +209,7 @@ impl App {
             return;
         }
 
-        let now_str = chrono::Local::now().format("%H:%M").to_string();
+        let now_str = chrono::Local::now().format(self.time_format).to_string();
         let now_chars: Vec<char> = now_str.chars().collect();
 
         let mut animating = false;
@@ -216,10 +241,12 @@ impl App {
             .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
             .expect("create buffer");
 
+        let bg = self.background_color;
         canvas.chunks_exact_mut(4).for_each(|pixel| {
-            pixel.copy_from_slice(&[0x00, 0x00, 0x00, 0xFF]);
+            pixel.copy_from_slice(&[bg.2, bg.1, bg.0, 0xFF]);
         });
 
+        let fg = self.digit_color;
         for i in 0..5 {
             let pen_x = self.slot_x[i];
             let slot = &self.slots[i];
@@ -227,8 +254,8 @@ impl App {
             match slot.anim {
                 None => {
                     let (m, b) = &self.glyphs[&slot.current];
-                    draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Top, 1.0);
-                    draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Bottom, 1.0);
+                    draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Top, 1.0, fg);
+                    draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Bottom, 1.0, fg);
                 }
                 Some((new_ch, start)) => {
                     let progress = (start.elapsed().as_secs_f32() / FLIP_DURATION.as_secs_f32()).min(1.0);
@@ -239,17 +266,17 @@ impl App {
                     if progress < 0.5 {
                         let q = progress / 0.5;
                         // New top revealed underneath as the old top shrinks away.
-                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Top, 1.0);
-                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Top, 1.0 - q);
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Top, 1.0, fg);
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Top, 1.0 - q, fg);
                         // Bottom hasn't started changing yet.
-                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0);
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0, fg);
                     } else {
                         let q = (progress - 0.5) / 0.5;
                         // Top settled onto its new value already.
-                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Top, 1.0);
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Top, 1.0, fg);
                         // New bottom grows in from the hinge, covering the old one.
-                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0);
-                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Bottom, q);
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0, fg);
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Bottom, q, fg);
                     }
                 }
             }
@@ -306,6 +333,7 @@ fn draw_glyph_half(
     hinge_y: i32,
     half: Half,
     scale: f32,
+    fg: (u8, u8, u8),
 ) {
     if scale <= 0.0 || metrics.width == 0 || metrics.height == 0 {
         return;
@@ -350,12 +378,21 @@ fn draw_glyph_half(
                 continue;
             }
             let idx = (canvas_y as u32 * width + px as u32) as usize * 4;
-            canvas[idx] = coverage;
-            canvas[idx + 1] = coverage;
-            canvas[idx + 2] = coverage;
+            // Blend from whatever's currently there (background, or an
+            // earlier-drawn layer) toward the digit color, weighted by
+            // this pixel's coverage — gives free antialiasing in any
+            // configured color pair, not just white-on-black.
+            let t = coverage as f32 / 255.0;
+            canvas[idx] = lerp_u8(canvas[idx], fg.2, t);
+            canvas[idx + 1] = lerp_u8(canvas[idx + 1], fg.1, t);
+            canvas[idx + 2] = lerp_u8(canvas[idx + 2], fg.0, t);
             canvas[idx + 3] = 0xFF;
         }
     }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
 impl CompositorHandler for App {
@@ -413,13 +450,68 @@ impl ShmHandler for App {
     }
 }
 
+// Dismiss-on-any-input, matching gluqlo's `-anykeyclose`: grab keyboard and
+// pointer devices as they show up, and exit on the first real interaction.
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
+        }
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+        }
+    }
+
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, capability: Capability) {
+        if capability == Capability::Keyboard {
+            self.keyboard.take();
+        }
+        if capability == Capability::Pointer {
+            self.pointer.take();
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl KeyboardHandler for App {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
+    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {
+        self.exit = true;
+    }
+    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
+    fn repeat_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
+    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: Modifiers, _: RawModifiers, _: u32) {}
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        for event in events {
+            // Ignore Enter/Leave — those fire just from the surface
+            // appearing under a stationary cursor, which would otherwise
+            // instantly dismiss us on launch. Only real interaction
+            // (movement, clicks, scroll) counts.
+            match event.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. } => {}
+                _ => self.exit = true,
+            }
+        }
+    }
+}
+
 delegate_registry!(App);
 
 impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 smithay_client_toolkit::delegate_dispatch2!(App);
