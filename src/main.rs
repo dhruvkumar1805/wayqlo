@@ -65,28 +65,44 @@ fn main() {
     let config = config::load();
 
     let conn = Connection::connect_to_env().expect("failed to connect to Wayland compositor");
-    let (globals, event_queue) = registry_queue_init(&conn).unwrap();
+    let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
     let qh = event_queue.handle();
 
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell not available on this compositor");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm not available");
 
-    let surface = compositor.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("wayqlo"), None);
-
-    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_exclusive_zone(-1);
-    // Exclusive (not OnDemand): grab keyboard focus the moment we're shown,
-    // rather than waiting for the user to click into us first. A
-    // screensaver-style overlay should react to the very first keypress.
-    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-    layer.commit();
-
-    let pool = SlotPool::new(1, &shm).expect("failed to create shm pool");
-
     let font = fontdue::Font::from_bytes(FONT_DATA, fontdue::FontSettings::default())
         .expect("failed to parse bundled font");
+
+    let time_format = config.hour_format.strftime();
+
+    let mut app = App {
+        registry_state: RegistryState::new(&globals),
+        output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        compositor,
+        layer_shell,
+        shm,
+        qh: qh.clone(),
+        font,
+        time_format,
+        digit_color: config.digit_color,
+        background_color: config.background_color,
+        card_color: config.card_color,
+        exit: false,
+        keyboard: None,
+        pointer: None,
+        outputs: Vec::new(),
+    };
+
+    // Every output currently connected is only known to us once the
+    // compositor has sent its wl_output geometry/mode/done events, which
+    // OutputState::new above only requested, not received. Round-trip
+    // once here so `new_output` below fires for all of them before we
+    // start the real event loop, otherwise we'd only ever catch outputs
+    // that happen to be hotplugged after startup.
+    event_queue.roundtrip(&mut app).expect("initial roundtrip failed");
 
     let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("failed to create event loop");
     let loop_handle = event_loop.handle();
@@ -95,38 +111,6 @@ fn main() {
         .insert(loop_handle.clone())
         .expect("failed to insert wayland source");
 
-    let time_format = config.hour_format.strftime();
-    let now_chars: Vec<char> = chrono::Local::now().format(time_format).to_string().chars().collect();
-
-    let mut app = App {
-        registry_state: RegistryState::new(&globals),
-        output_state: OutputState::new(&globals, &qh),
-        seat_state: SeatState::new(&globals, &qh),
-        shm,
-        pool,
-        layer,
-        qh: qh.clone(),
-        font,
-        time_format,
-        digit_color: config.digit_color,
-        background_color: config.background_color,
-        card_color: config.card_color,
-        width: 0,
-        height: 0,
-        first_configure: true,
-        exit: false,
-        animating: false,
-        keyboard: None,
-        pointer: None,
-        glyphs: HashMap::new(),
-        slot_x: [0.0; 4],
-        baseline: 0.0,
-        hinge_y: 0,
-        card_rects: [(0, 0, 0, 0); 2],
-        card_radius: 0,
-        slots: std::array::from_fn(|i| DigitSlot { current: now_chars[DIGIT_POS[i]], anim: None }),
-    };
-
     // The timer's only job is a coarse poll for "did the clock value
     // change" while idle. Once a flip starts, redraw pacing hands off
     // entirely to frame callbacks (see CompositorHandler::frame below) —
@@ -134,11 +118,15 @@ fn main() {
     // often as the compositor is ready to show a new frame.
     loop_handle
         .insert_source(Timer::immediate(), |_deadline, _, app| {
-            // Guard against firing before the first `configure` event has
-            // arrived (width/height still 0, glyph cache still empty).
-            if app.width > 0 && app.height > 0 && !app.animating {
-                app.advance();
-                app.draw();
+            let now_chars: Vec<char> = chrono::Local::now().format(app.time_format).to_string().chars().collect();
+            for output in &mut app.outputs {
+                // Guard against firing before the first `configure` event
+                // has arrived (width/height still 0, glyph cache still
+                // empty).
+                if output.width > 0 && output.height > 0 && !output.animating {
+                    output.advance(&now_chars);
+                    output.draw(&app.qh, app.digit_color, app.background_color, app.card_color);
+                }
             }
             TimeoutAction::ToDuration(Duration::from_millis(300))
         })
@@ -161,28 +149,55 @@ struct DigitSlot {
     anim: Option<(char, Instant)>, // (new value, animation start time)
 }
 
+impl DigitSlot {
+    fn new(current: char) -> Self {
+        DigitSlot { current, anim: None }
+    }
+}
+
 struct App {
     registry_state: RegistryState,
     output_state: OutputState,
     seat_state: SeatState,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
     shm: Shm,
-    pool: SlotPool,
-    layer: LayerSurface,
     qh: QueueHandle<App>,
     font: fontdue::Font,
     time_format: &'static str,
     digit_color: (u8, u8, u8),
     background_color: (u8, u8, u8),
     card_color: (u8, u8, u8),
+    exit: bool,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+
+    // One fullscreen layer surface per connected output: a screensaver
+    // that only covered one monitor would leave every other screen
+    // uncovered and awake.
+    outputs: Vec<OutputSurface>,
+}
+
+impl App {
+    fn output_surface_for(&mut self, surface: &wl_surface::WlSurface) -> Option<&mut OutputSurface> {
+        self.outputs.iter_mut().find(|o| o.layer.wl_surface() == surface)
+    }
+}
+
+/// The fullscreen flip-clock surface shown on a single output, plus all
+/// the layout/animation state that's naturally per-output (screen size,
+/// rasterized glyphs sized to fit that screen, and independent flip
+/// animation timing).
+struct OutputSurface {
+    wl_output: wl_output::WlOutput,
+    layer: LayerSurface,
+    pool: SlotPool,
     width: u32,
     height: u32,
     first_configure: bool,
-    exit: bool,
     // True while any digit slot is mid-flip. While true, redraws are paced
     // by frame callbacks instead of the idle-poll timer.
     animating: bool,
-    keyboard: Option<wl_keyboard::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
 
     // Cache of rasterized glyphs for '0'..'9', keyed by character,
     // computed once per screen size instead of every frame.
@@ -199,7 +214,26 @@ struct App {
     slots: [DigitSlot; 4],
 }
 
-impl App {
+impl OutputSurface {
+    fn new(wl_output: wl_output::WlOutput, layer: LayerSurface, pool: SlotPool, now_chars: &[char]) -> Self {
+        OutputSurface {
+            wl_output,
+            layer,
+            pool,
+            width: 0,
+            height: 0,
+            first_configure: true,
+            animating: false,
+            glyphs: HashMap::new(),
+            slot_x: [0.0; 4],
+            baseline: 0.0,
+            hinge_y: 0,
+            card_rects: [(0, 0, 0, 0); 2],
+            card_radius: 0,
+            slots: std::array::from_fn(|i| DigitSlot::new(now_chars[DIGIT_POS[i]])),
+        }
+    }
+
     /// Rasterizes and caches every glyph we'll ever need, and computes the
     /// fixed on-screen card/slot layout. Called whenever the surface size
     /// is (re)established.
@@ -208,7 +242,7 @@ impl App {
     /// width-driven rectangle sized to fit its digits (an earlier version
     /// did that, and the proportions kept drifting no matter how much the
     /// padding ratios were tuned).
-    fn layout(&mut self) {
+    fn layout(&mut self, font: &fontdue::Font) {
         let h = self.height as f32;
         let w = self.width as f32;
 
@@ -224,7 +258,7 @@ impl App {
         for _ in 0..2 {
             self.glyphs.clear();
             for c in "0123456789".chars() {
-                self.glyphs.insert(c, self.font.rasterize(c, size));
+                self.glyphs.insert(c, font.rasterize(c, size));
             }
             let digit_width = self.glyphs[&'0'].0.advance_width;
             let inner_width = 2.0 * digit_width + size * 0.02;
@@ -274,13 +308,10 @@ impl App {
     /// Checks the real clock and starts/advances/settles any flip
     /// animations. Pure state update — does not draw. Updates
     /// `self.animating` to reflect whether anything is still mid-flip.
-    fn advance(&mut self) {
+    fn advance(&mut self, now_chars: &[char]) {
         if self.width == 0 || self.height == 0 {
             return;
         }
-
-        let now_str = chrono::Local::now().format(self.time_format).to_string();
-        let now_chars: Vec<char> = now_str.chars().collect();
 
         let mut animating = false;
         for i in 0..4 {
@@ -303,7 +334,7 @@ impl App {
         self.animating = animating;
     }
 
-    fn draw(&mut self) {
+    fn draw(&mut self, qh: &QueueHandle<App>, digit_color: (u8, u8, u8), background_color: (u8, u8, u8), card_color: (u8, u8, u8)) {
         let (width, height) = (self.width, self.height);
         let stride = width as i32 * 4;
 
@@ -312,7 +343,7 @@ impl App {
             .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
             .expect("create buffer");
 
-        let bg = self.background_color;
+        let bg = background_color;
         canvas.chunks_exact_mut(4).for_each(|pixel| {
             pixel.copy_from_slice(&[bg.2, bg.1, bg.0, 0xFF]);
         });
@@ -322,7 +353,7 @@ impl App {
         // and reads as clutter rather than "premium" — real flip-clock
         // displays are this minimal on purpose.
         for &(x0, y0, x1, y1) in &self.card_rects {
-            fill_rounded_rect(canvas, width, height, x0, y0, x1, y1, self.card_radius, self.card_color);
+            fill_rounded_rect(canvas, width, height, x0, y0, x1, y1, self.card_radius, card_color);
         }
 
         // The hinge: a thin black gap plus a light 1px line, not a shadow
@@ -331,7 +362,7 @@ impl App {
             draw_hinge_line(canvas, width, height, x0, x1, self.hinge_y, height);
         }
 
-        let fg = self.digit_color;
+        let fg = digit_color;
         for i in 0..4 {
             let pen_x = self.slot_x[i];
             let slot = &self.slots[i];
@@ -393,7 +424,7 @@ impl App {
         // nothing else is driving redraws).
         if self.animating {
             let surface = self.layer.wl_surface();
-            surface.frame(&self.qh, FrameCallbackData(surface.clone()));
+            surface.frame(qh, FrameCallbackData(surface.clone()));
         }
 
         self.layer.commit();
@@ -568,14 +599,20 @@ fn draw_hinge_line(canvas: &mut [u8], width: u32, height: u32, x0: i32, x1: i32,
 impl CompositorHandler for App {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
-        // The compositor is ready for a new frame. If we're mid-flip,
-        // advance the animation and redraw — draw() itself will ask for
-        // another frame callback if still animating afterward, keeping
-        // this loop going at the compositor's own pace.
-        if self.animating {
-            self.advance();
-            self.draw();
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
+        // The compositor is ready for a new frame on this specific
+        // output's surface. If it's mid-flip, advance the animation and
+        // redraw. draw() itself will ask for another frame callback if
+        // still animating afterward, keeping this loop going at the
+        // compositor's own pace.
+        let now_chars: Vec<char> = chrono::Local::now().format(self.time_format).to_string().chars().collect();
+        let (digit_color, background_color, card_color) = (self.digit_color, self.background_color, self.card_color);
+        let qh = self.qh.clone();
+        if let Some(output) = self.output_surface_for(surface) {
+            if output.animating {
+                output.advance(&now_chars);
+                output.draw(&qh, digit_color, background_color, card_color);
+            }
         }
     }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
@@ -586,30 +623,68 @@ impl OutputHandler for App {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+
+    // Fires once per output: both for every output already connected at
+    // startup (after the initial roundtrip in main()) and for any
+    // hotplugged later. Each gets its own fullscreen layer surface so the
+    // screensaver actually covers every screen, not just whichever one
+    // the compositor happened to default a placement-less surface onto.
+    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, wl_output: wl_output::WlOutput) {
+        let surface = self.compositor.create_surface(qh);
+        let layer =
+            self.layer_shell
+                .create_layer_surface(qh, surface, Layer::Overlay, Some("wayqlo"), Some(&wl_output));
+
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_exclusive_zone(-1);
+        // Exclusive (not OnDemand): grab keyboard focus the moment we're shown,
+        // rather than waiting for the user to click into us first. A
+        // screensaver-style overlay should react to the very first keypress.
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.commit();
+
+        let pool = SlotPool::new(1, &self.shm).expect("failed to create shm pool");
+
+        let now_chars: Vec<char> = chrono::Local::now().format(self.time_format).to_string().chars().collect();
+        self.outputs.push(OutputSurface::new(wl_output, layer, pool, &now_chars));
+    }
+
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, wl_output: wl_output::WlOutput) {
+        self.outputs.retain(|o| o.wl_output != wl_output);
+    }
 }
 
 impl LayerShellHandler for App {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = true;
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        self.outputs.retain(|o| &o.layer != layer);
+        // If the compositor closed every one of our surfaces (e.g. all
+        // outputs went away), there's nothing left to do.
+        if self.outputs.is_empty() {
+            self.exit = true;
+        }
     }
 
     fn configure(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        self.width = configure.new_size.0;
-        self.height = configure.new_size.1;
-        self.layout();
-        if self.first_configure {
-            self.first_configure = false;
-            self.draw();
+        let font = &self.font;
+        let (digit_color, background_color, card_color) = (self.digit_color, self.background_color, self.card_color);
+        let qh = self.qh.clone();
+        if let Some(output) = self.outputs.iter_mut().find(|o| &o.layer == layer) {
+            output.width = configure.new_size.0;
+            output.height = configure.new_size.1;
+            output.layout(font);
+            if output.first_configure {
+                output.first_configure = false;
+                output.draw(&qh, digit_color, background_color, card_color);
+            }
         }
     }
 }
