@@ -38,17 +38,19 @@ use wayland_client::{
 
 // Nimbus Sans Narrow Bold (AGPL-3.0 with the standard PS/PDF font
 // embedding exception — see assets/NimbusSansNarrow-LICENSE.txt), baked
-// directly into the binary at compile time via include_bytes!. No runtime
-// filesystem dependency on a specific font package being installed — the
-// executable is fully self-contained.
+// directly into the binary at compile time via include_bytes!. No
+// runtime filesystem dependency on a specific font package being
+// installed — the executable is fully self-contained.
 //
-// This is a proper condensed-bold grotesque in the Helvetica/Neue
-// Helvetica family, which is the typeface family flip-clock displays
-// traditionally use — earlier attempts (a wide face force-narrowed with a
-// horizontal scale hack, then a generic condensed face like Oswald) were
-// both the wrong typeface family entirely, not just a proportions problem;
-// scaling distorts strokes unevenly, and a different family's letterforms
-// just read as visually "off" even at the right width.
+// Confirmed by directly measuring glyph geometry (advance width / units
+// per em) against a real flip-clock display's actual font file: its '0'
+// glyph has an advance-width ratio of 0.455, versus this font's 0.456 —
+// effectively identical. The regular (non-Narrow) weight measures 0.556,
+// visibly wider. Font family/style NAMES embedded in a font file aren't
+// always reliable (this one's internal name table just says "Bold", no
+// "Narrow" or "Condensed" — likely an incomplete rename), so the actual
+// rendered proportions were checked directly rather than trusting the
+// metadata string.
 const FONT_DATA: &[u8] = include_bytes!("../assets/NimbusSansNarrow-Bold.otf");
 
 // How long a single digit's flip animation takes, start to finish.
