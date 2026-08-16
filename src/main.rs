@@ -36,9 +36,11 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-// The font used to draw the clock digits. Loaded from the system for now;
-// we'll bundle our own font file once we get to the final flip-card look.
-const FONT_PATH: &str = "/usr/share/fonts/noto/NotoSans-Bold.ttf";
+// Inter ExtraBold (OFL-1.1 licensed, see assets/Inter-LICENSE.txt), baked
+// directly into the binary at compile time via include_bytes!. No runtime
+// filesystem dependency on a specific font package being installed — the
+// executable is fully self-contained.
+const FONT_DATA: &[u8] = include_bytes!("../assets/Inter-ExtraBold.ttf");
 
 // How long a single digit's flip animation takes, start to finish.
 const FLIP_DURATION: Duration = Duration::from_millis(350);
@@ -72,9 +74,8 @@ fn main() {
 
     let pool = SlotPool::new(1, &shm).expect("failed to create shm pool");
 
-    let font_bytes = std::fs::read(FONT_PATH).expect("failed to read font file");
-    let font = fontdue::Font::from_bytes(font_bytes, fontdue::FontSettings::default())
-        .expect("failed to parse font");
+    let font = fontdue::Font::from_bytes(FONT_DATA, fontdue::FontSettings::default())
+        .expect("failed to parse bundled font");
 
     let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("failed to create event loop");
     let loop_handle = event_loop.handle();
@@ -299,6 +300,27 @@ impl App {
             fill_rounded_rect(canvas, width, height, x0, y0, x1, y1, self.card_radius, self.card_color);
         }
 
+        // A faint top-edge highlight on each card — a hint of light
+        // catching a beveled edge, which reads as physical depth even
+        // though it's just one brighter line.
+        let highlight = (
+            (self.card_color.0 as u16 + 22).min(255) as u8,
+            (self.card_color.1 as u16 + 22).min(255) as u8,
+            (self.card_color.2 as u16 + 22).min(255) as u8,
+        );
+        for &(x0, y0, x1, _) in &self.card_rects {
+            for x in (x0 + self.card_radius).max(0)..(x1 - self.card_radius).min(width as i32) {
+                let y = y0 + 1;
+                if y < 0 || y as u32 >= height {
+                    continue;
+                }
+                let idx = (y as u32 * width + x as u32) as usize * 4;
+                canvas[idx] = highlight.2;
+                canvas[idx + 1] = highlight.1;
+                canvas[idx + 2] = highlight.0;
+            }
+        }
+
         let fg = self.digit_color;
         for i in 0..4 {
             let pen_x = self.slot_x[i];
@@ -402,6 +424,17 @@ fn draw_glyph_half(
     if scale <= 0.0 || metrics.width == 0 || metrics.height == 0 {
         return;
     }
+
+    // A card rotating toward edge-on catches light at an ever-grazing
+    // angle, so it visibly darkens as it approaches the hinge — this is
+    // near-zero at scale=1 (flat on, full color; a static/background half
+    // is unaffected) and strongest right at scale=0 (edge-on).
+    let darken = (1.0 - scale).clamp(0.0, 1.0) * 0.45;
+    let fg = (
+        (fg.0 as f32 * (1.0 - darken)) as u8,
+        (fg.1 as f32 * (1.0 - darken)) as u8,
+        (fg.2 as f32 * (1.0 - darken)) as u8,
+    );
 
     // Canvas y where bitmap row 0 would land, if drawn unscaled.
     let glyph_top = baseline as i32 - metrics.ymin - metrics.height as i32;
