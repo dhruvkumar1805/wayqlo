@@ -204,6 +204,17 @@ struct OutputSurface {
     // Cache of rasterized glyphs for '0'..'9', keyed by character,
     // computed once per screen size instead of every frame.
     glyphs: HashMap<char, (fontdue::Metrics, Vec<u8>)>,
+    // Heavily blurred, dimmed copies of the same glyphs, drawn beneath the
+    // sharp ones on a settled (non-flipping) digit so it reads as glowing
+    // backlit glass instead of flat printed ink. Precomputed here rather
+    // than blurred every frame: a real Gaussian blur over a full glyph is
+    // far too costly to redo 60 times a second.
+    glow_glyphs: HashMap<char, (fontdue::Metrics, Vec<u8>)>,
+    // Center and half-extent of the whole clock's bounding box (both
+    // cards together), used to paint a soft ambient bloom on the
+    // background behind it.
+    glow_center: (f32, f32),
+    glow_half: (f32, f32),
     // Precomputed, fixed x position for each of the 4 digit slots, so
     // digits don't jitter horizontally as they change width.
     slot_x: [f32; 4],
@@ -241,6 +252,9 @@ impl OutputSurface {
             first_configure: true,
             animating: false,
             glyphs: HashMap::new(),
+            glow_glyphs: HashMap::new(),
+            glow_center: (0.0, 0.0),
+            glow_half: (1.0, 1.0),
             slot_x: [0.0; 4],
             hour_center: 0.0,
             baseline: 0.0,
@@ -354,6 +368,38 @@ impl OutputSurface {
             self.label_x = hour_x0 + rectsize * 0.08;
             self.label_baseline = (digit_bottom + gap + label_ascent).min(start_y + rectsize - bottom_padding);
         }
+
+        // Glow: a large soft blur of each digit, dimmed well below the
+        // digit color, drawn under the sharp glyph. Blurred once here at
+        // this resolution rather than resampled per frame.
+        self.glow_glyphs.clear();
+        let glow_pad = (size * 0.09).round().max(1.0) as usize;
+        let glow_radius = (size * 0.035).round().max(1.0) as usize;
+        for c in "0123456789".chars() {
+            let (m, b) = &self.glyphs[&c];
+            let (gw, gh, gbuf) = blur_glyph(b, m.width, m.height, glow_pad, glow_radius, 0.4);
+            let glow_m = fontdue::Metrics {
+                xmin: m.xmin - glow_pad as i32,
+                ymin: m.ymin - glow_pad as i32,
+                width: gw,
+                height: gh,
+                advance_width: m.advance_width,
+                advance_height: m.advance_height,
+                bounds: m.bounds,
+            };
+            self.glow_glyphs.insert(c, (glow_m, gbuf));
+        }
+
+        // Ambient bloom on the background, centered on both cards
+        // together: it's what sells the clock as something actually
+        // emitting light into the dark room around it, rather than a
+        // shape stamped on top of flat black.
+        let clock_x0 = self.card_rects[0].0.min(self.card_rects[1].0) as f32;
+        let clock_x1 = self.card_rects[0].2.max(self.card_rects[1].2) as f32;
+        let clock_y0 = self.card_rects[0].1 as f32;
+        let clock_y1 = self.card_rects[0].3 as f32;
+        self.glow_center = ((clock_x0 + clock_x1) / 2.0, (clock_y0 + clock_y1) / 2.0);
+        self.glow_half = (((clock_x1 - clock_x0) / 2.0).max(1.0), ((clock_y1 - clock_y0) / 2.0).max(1.0));
     }
 
     /// Checks the real clock and starts/advances/settles any flip
@@ -394,10 +440,28 @@ impl OutputSurface {
             .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
             .expect("create buffer");
 
+        // Background fill, plus a soft ambient bloom bleeding outward from
+        // the clock: it reads as the clock actually lighting the dark
+        // room around it rather than sitting flat on top of it. Strongest
+        // right at the clock's own bounding box, fully gone by 2.6x its
+        // half-extent.
         let bg = background_color;
-        canvas.chunks_exact_mut(4).for_each(|pixel| {
-            pixel.copy_from_slice(&[bg.2, bg.1, bg.0, 0xFF]);
-        });
+        let (gcx, gcy) = self.glow_center;
+        let (ghx, ghy) = self.glow_half;
+        for y in 0..height {
+            for x in 0..width {
+                let dx = (x as f32 - gcx) / ghx;
+                let dy = (y as f32 - gcy) / ghy;
+                let nd = (dx * dx + dy * dy).sqrt();
+                let t = ((nd - 1.0) / 1.6).clamp(0.0, 1.0);
+                let glow = (1.0 - smoothstep(t)) * 0.10;
+                let idx = (y * width + x) as usize * 4;
+                canvas[idx] = lerp_u8(bg.2, digit_color.2, glow);
+                canvas[idx + 1] = lerp_u8(bg.1, digit_color.1, glow);
+                canvas[idx + 2] = lerp_u8(bg.0, digit_color.0, glow);
+                canvas[idx + 3] = 0xFF;
+            }
+        }
 
         // The two card panels: a single flat fill, nothing more. Extra
         // chrome (grain, borders, highlight lines, drop shadows) was tried
@@ -430,6 +494,14 @@ impl OutputSurface {
                     } else {
                         self.slot_x[i]
                     };
+                    // The glow only makes sense for a settled digit: mid-flip
+                    // the glyph is already being split and rescaled by
+                    // draw_glyph_half, and re-deriving a blurred version of
+                    // that per frame would cost far more than it's worth for
+                    // something visible 260ms out of every 60 seconds.
+                    if let Some((gm, gb)) = self.glow_glyphs.get(&slot.current) {
+                        draw_glyph(canvas, width, height, pen_x, self.baseline, gm, gb, fg);
+                    }
                     draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Top, 1.0, fg);
                     draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Bottom, 1.0, fg);
                 }
@@ -459,6 +531,19 @@ impl OutputSurface {
                     // one continuous motion with no pause.
                     let eased = smoothstep(progress);
 
+                    let (card_x0, card_y0, card_x1, card_y1) = self.card_rects[i / 2];
+                    let card_mid_x = (card_x0 + card_x1) / 2;
+                    let (slot_x0, slot_x1) = if i % 2 == 0 { (card_x0, card_mid_x) } else { (card_mid_x, card_x1) };
+                    // A flip clock's signature tell isn't the squish, it's
+                    // the soft shadow the rotating flap throws onto the
+                    // surface it's passing close to right at its own
+                    // moving edge, gone the instant the flap stops moving.
+                    // Unlike a static drop shadow sitting under the whole
+                    // card at rest (tried before here and cut as clutter,
+                    // see the card-fill comment above), this one only
+                    // exists while something is actually rotating.
+                    let shadow_band = ((card_y1 - card_y0) as f32 * 0.06).round() as i32;
+
                     if eased < 0.5 {
                         let q = eased / 0.5;
                         // New top revealed underneath as the old top shrinks away.
@@ -466,6 +551,11 @@ impl OutputSurface {
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Top, 1.0 - q, fg);
                         // Bottom hasn't started changing yet.
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0, fg);
+
+                        let flap_reach = (self.hinge_y - card_y0) as f32 * (1.0 - q);
+                        let edge_y = self.hinge_y - flap_reach as i32;
+                        let shadow_strength = 4.0 * q * (1.0 - q) * 0.28;
+                        draw_shadow_band(canvas, width, height, slot_x0, slot_x1, edge_y, -1, shadow_band, shadow_strength);
                     } else {
                         let q = (eased - 0.5) / 0.5;
                         // Top settled onto its new value already.
@@ -473,6 +563,11 @@ impl OutputSurface {
                         // New bottom grows in from the hinge, covering the old one.
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0, fg);
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Bottom, q, fg);
+
+                        let flap_reach = (card_y1 - self.hinge_y) as f32 * q;
+                        let edge_y = self.hinge_y + flap_reach as i32;
+                        let shadow_strength = 4.0 * q * (1.0 - q) * 0.28;
+                        draw_shadow_band(canvas, width, height, slot_x0, slot_x1, edge_y, 1, shadow_band, shadow_strength);
                     }
                 }
             }
@@ -513,6 +608,34 @@ impl OutputSurface {
 fn smoothstep(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Darkens a horizontal strip `band_px` tall, starting at `edge_y` and
+/// fading to nothing over its width in the given `dir` (+1 down, -1 up).
+/// This is the shadow a rotating flap throws on the surface it's passing
+/// close to, right at its own moving edge: it's what makes a flip read as
+/// a rigid card actually rotating in 3D rather than a shape being
+/// squashed in 2D, and it only exists while `strength` (driven by the
+/// flip's own progress) is nonzero, never as a resting-state decoration.
+#[allow(clippy::too_many_arguments)]
+fn draw_shadow_band(canvas: &mut [u8], width: u32, height: u32, x0: i32, x1: i32, edge_y: i32, dir: i32, band_px: i32, strength: f32) {
+    if strength <= 0.0 || band_px <= 0 {
+        return;
+    }
+    for d in 0..band_px {
+        let y = edge_y + dir * d;
+        if y < 0 || y as u32 >= height {
+            continue;
+        }
+        let t = strength * (1.0 - d as f32 / band_px as f32);
+        let idx_row = y as u32 * width;
+        for x in x0.max(0)..x1.min(width as i32) {
+            let idx = (idx_row + x as u32) as usize * 4;
+            canvas[idx] = lerp_u8(canvas[idx], 0, t);
+            canvas[idx + 1] = lerp_u8(canvas[idx + 1], 0, t);
+            canvas[idx + 2] = lerp_u8(canvas[idx + 2], 0, t);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -641,6 +764,71 @@ fn draw_glyph(canvas: &mut [u8], width: u32, height: u32, pen_x: f32, baseline: 
             canvas[idx + 3] = 0xFF;
         }
     }
+}
+
+/// Pads a glyph's coverage bitmap by `pad` pixels on every side, then
+/// runs a few passes of a fast separable box blur (three passes reads as
+/// close to a true Gaussian blur as makes any visible difference) to turn
+/// its crisp edges into a soft bleed. `intensity` scales the final result
+/// down (a glow needs to stay well under full brightness, not look like a
+/// second copy of the digit), and is applied last so the blur itself
+/// still operates on full-precision values. Returns the new (width,
+/// height, bitmap) of the padded, blurred result.
+fn blur_glyph(src: &[u8], w: usize, h: usize, pad: usize, radius: usize, intensity: f32) -> (usize, usize, Vec<u8>) {
+    let bw = w + pad * 2;
+    let bh = h + pad * 2;
+    let mut buf = vec![0u32; bw * bh];
+    for y in 0..h {
+        for x in 0..w {
+            buf[(y + pad) * bw + (x + pad)] = src[y * w + x] as u32;
+        }
+    }
+    for _ in 0..3 {
+        buf = box_blur_horizontal(&buf, bw, bh, radius);
+        buf = box_blur_vertical(&buf, bw, bh, radius);
+    }
+    let out = buf.iter().map(|&v| ((v as f32) * intensity).min(255.0) as u8).collect();
+    (bw, bh, out)
+}
+
+/// One pass of a box blur along rows. Out-of-range neighbors count as 0
+/// (not clamped to the edge pixel) since `src` is already zero-padded: a
+/// glow should fade toward nothing at its own edges, not smear the
+/// glyph's boundary pixels outward.
+fn box_blur_horizontal(src: &[u32], w: usize, h: usize, r: usize) -> Vec<u32> {
+    let mut out = vec![0u32; w * h];
+    let window = (2 * r + 1) as u32;
+    let mut prefix = vec![0u32; w + 1];
+    for y in 0..h {
+        let row = &src[y * w..(y + 1) * w];
+        for x in 0..w {
+            prefix[x + 1] = prefix[x] + row[x];
+        }
+        for x in 0..w {
+            let lo = x.saturating_sub(r);
+            let hi = (x + r + 1).min(w);
+            out[y * w + x] = (prefix[hi] - prefix[lo]) / window;
+        }
+    }
+    out
+}
+
+/// Same as [`box_blur_horizontal`], along columns instead.
+fn box_blur_vertical(src: &[u32], w: usize, h: usize, r: usize) -> Vec<u32> {
+    let mut out = vec![0u32; w * h];
+    let window = (2 * r + 1) as u32;
+    let mut prefix = vec![0u32; h + 1];
+    for x in 0..w {
+        for y in 0..h {
+            prefix[y + 1] = prefix[y] + src[y * w + x];
+        }
+        for y in 0..h {
+            let lo = y.saturating_sub(r);
+            let hi = (y + r + 1).min(h);
+            out[y * w + x] = (prefix[hi] - prefix[lo]) / window;
+        }
+    }
+    out
 }
 
 /// Fills an axis-aligned rectangle with rounded corners. Standard
