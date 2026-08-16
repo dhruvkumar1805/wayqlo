@@ -43,6 +43,11 @@ const FONT_PATH: &str = "/usr/share/fonts/noto/NotoSans-Bold.ttf";
 // How long a single digit's flip animation takes, start to finish.
 const FLIP_DURATION: Duration = Duration::from_millis(350);
 
+// Index into the formatted "HH:MM" time string for each of our 4 digit
+// slots (H, H, M, M) — index 2 (the ':') is skipped since it's drawn
+// separately as two static dots, not a digit slot.
+const DIGIT_POS: [usize; 4] = [0, 1, 3, 4];
+
 fn main() {
     let config = config::load();
 
@@ -93,6 +98,7 @@ fn main() {
         time_format,
         digit_color: config.digit_color,
         background_color: config.background_color,
+        card_color: config.card_color,
         width: 0,
         height: 0,
         first_configure: true,
@@ -101,10 +107,15 @@ fn main() {
         keyboard: None,
         pointer: None,
         glyphs: HashMap::new(),
-        slot_x: [0.0; 5],
+        slot_x: [0.0; 4],
         baseline: 0.0,
         hinge_y: 0,
-        slots: std::array::from_fn(|i| DigitSlot { current: now_chars[i], anim: None }),
+        card_rects: [(0, 0, 0, 0); 2],
+        card_radius: 0,
+        hinge_band: 0,
+        colon_dots: [(0, 0); 2],
+        dot_radius: 0,
+        slots: std::array::from_fn(|i| DigitSlot { current: now_chars[DIGIT_POS[i]], anim: None }),
     };
 
     // The timer's only job is a coarse poll for "did the clock value
@@ -132,7 +143,7 @@ fn main() {
     }
 }
 
-/// One of the 5 character positions on screen (H, H, :, M, M).
+/// One of the 4 digit positions on screen (H, H, M, M).
 struct DigitSlot {
     /// The value currently considered "settled" (fully shown, no longer
     /// animating either way).
@@ -153,6 +164,7 @@ struct App {
     time_format: &'static str,
     digit_color: (u8, u8, u8),
     background_color: (u8, u8, u8),
+    card_color: (u8, u8, u8),
     width: u32,
     height: u32,
     first_configure: bool,
@@ -163,42 +175,76 @@ struct App {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
 
-    // Cache of rasterized glyphs for '0'..'9' and ':', keyed by character,
+    // Cache of rasterized glyphs for '0'..'9', keyed by character,
     // computed once per screen size instead of every frame.
     glyphs: HashMap<char, (fontdue::Metrics, Vec<u8>)>,
-    // Precomputed, fixed x position for each of the 5 character slots, so
+    // Precomputed, fixed x position for each of the 4 digit slots, so
     // digits don't jitter horizontally as they change width.
-    slot_x: [f32; 5],
+    slot_x: [f32; 4],
     baseline: f32,
     hinge_y: i32,
+    // (x0, y0, x1, y1) for the hour-pair card and the minute-pair card.
+    card_rects: [(i32, i32, i32, i32); 2],
+    card_radius: i32,
+    // How many pixels above/below the hinge the fold shadow fades out over.
+    hinge_band: i32,
+    // Center of each of the 2 colon dots.
+    colon_dots: [(i32, i32); 2],
+    dot_radius: i32,
 
-    slots: [DigitSlot; 5],
+    slots: [DigitSlot; 4],
 }
 
 impl App {
     /// Rasterizes and caches every glyph we'll ever need, and computes the
-    /// fixed on-screen slot layout. Called whenever the surface size is
-    /// (re)established.
+    /// fixed on-screen card/slot layout. Called whenever the surface size
+    /// is (re)established.
     fn layout(&mut self) {
-        let size = self.height as f32 * 0.35;
+        let size = self.height as f32 * 0.32;
         self.glyphs.clear();
-        for c in "0123456789:".chars() {
+        for c in "0123456789".chars() {
             self.glyphs.insert(c, self.font.rasterize(c, size));
         }
 
-        let digit_width = self.glyphs[&'0'].0.advance_width;
-        let colon_width = self.glyphs[&':'].0.advance_width;
-        let total_width = digit_width * 4.0 + colon_width;
+        let digit = &self.glyphs[&'0'].0;
+        let digit_width = digit.advance_width;
+        let glyph_height = digit.height as f32;
+
+        let card_padding_x = size * 0.28;
+        let card_padding_y = size * 0.16;
+        let digit_gap = size * 0.02;
+        let pair_gap = size * 0.55;
+
+        let card_width = 2.0 * digit_width + digit_gap + 2.0 * card_padding_x;
+        let half_card_height = (glyph_height / 2.0 + card_padding_y).round() as i32;
+
+        let total_width = 2.0 * card_width + pair_gap;
         let start_x = (self.width as f32 - total_width) / 2.0;
 
-        self.slot_x[0] = start_x;
-        self.slot_x[1] = self.slot_x[0] + digit_width;
-        self.slot_x[2] = self.slot_x[1] + digit_width;
-        self.slot_x[3] = self.slot_x[2] + colon_width;
-        self.slot_x[4] = self.slot_x[3] + digit_width;
+        let hour_x0 = start_x;
+        let hour_x1 = start_x + card_width;
+        let minute_x0 = hour_x1 + pair_gap;
+        let minute_x1 = minute_x0 + card_width;
+
+        self.slot_x[0] = hour_x0 + card_padding_x;
+        self.slot_x[1] = self.slot_x[0] + digit_width + digit_gap;
+        self.slot_x[2] = minute_x0 + card_padding_x;
+        self.slot_x[3] = self.slot_x[2] + digit_width + digit_gap;
 
         self.baseline = self.height as f32 / 2.0 + size / 3.0;
         self.hinge_y = self.height as i32 / 2;
+
+        let card_top = self.hinge_y - half_card_height;
+        let card_bottom = self.hinge_y + half_card_height;
+        self.card_rects[0] = (hour_x0 as i32, card_top, hour_x1 as i32, card_bottom);
+        self.card_rects[1] = (minute_x0 as i32, card_top, minute_x1 as i32, card_bottom);
+        self.card_radius = (size * 0.06).round() as i32;
+        self.hinge_band = ((size * 0.06).round() as i32).max(2);
+
+        self.dot_radius = (size * 0.035).round() as i32;
+        let dot_spacing = (size * 0.15).round() as i32;
+        let colon_x = ((hour_x1 + minute_x0) / 2.0).round() as i32;
+        self.colon_dots = [(colon_x, self.hinge_y - dot_spacing), (colon_x, self.hinge_y + dot_spacing)];
     }
 
     /// Checks the real clock and starts/advances/settles any flip
@@ -213,7 +259,8 @@ impl App {
         let now_chars: Vec<char> = now_str.chars().collect();
 
         let mut animating = false;
-        for i in 0..5 {
+        for i in 0..4 {
+            let target = now_chars[DIGIT_POS[i]];
             if let Some((new_ch, start)) = self.slots[i].anim {
                 let progress = start.elapsed().as_secs_f32() / FLIP_DURATION.as_secs_f32();
                 if progress >= 1.0 {
@@ -223,8 +270,8 @@ impl App {
                     animating = true;
                 }
             }
-            if self.slots[i].anim.is_none() && self.slots[i].current != now_chars[i] {
-                self.slots[i].anim = Some((now_chars[i], Instant::now()));
+            if self.slots[i].anim.is_none() && self.slots[i].current != target {
+                self.slots[i].anim = Some((target, Instant::now()));
                 animating = true;
             }
         }
@@ -246,8 +293,14 @@ impl App {
             pixel.copy_from_slice(&[bg.2, bg.1, bg.0, 0xFF]);
         });
 
+        // The two card panels sit behind everything else — digits and the
+        // hinge shadow both draw on top of them.
+        for &(x0, y0, x1, y1) in &self.card_rects {
+            fill_rounded_rect(canvas, width, height, x0, y0, x1, y1, self.card_radius, self.card_color);
+        }
+
         let fg = self.digit_color;
-        for i in 0..5 {
+        for i in 0..4 {
             let pen_x = self.slot_x[i];
             let slot = &self.slots[i];
 
@@ -264,14 +317,16 @@ impl App {
                     let (new_m, new_b) = &self.glyphs[&new_ch];
 
                     if progress < 0.5 {
-                        let q = progress / 0.5;
+                        // Eased (smoothstep) rather than linear, so the fold
+                        // decelerates into the hinge instead of snapping.
+                        let q = smoothstep(progress / 0.5);
                         // New top revealed underneath as the old top shrinks away.
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Top, 1.0, fg);
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Top, 1.0 - q, fg);
                         // Bottom hasn't started changing yet.
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0, fg);
                     } else {
-                        let q = (progress - 0.5) / 0.5;
+                        let q = smoothstep((progress - 0.5) / 0.5);
                         // Top settled onto its new value already.
                         draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Top, 1.0, fg);
                         // New bottom grows in from the hinge, covering the old one.
@@ -282,13 +337,15 @@ impl App {
             }
         }
 
-        // The hinge line running across every card, for the "flip card" look.
-        for x in 0..width {
-            let idx = (self.hinge_y as u32 * width + x) as usize * 4;
-            canvas[idx] = 0x18;
-            canvas[idx + 1] = 0x18;
-            canvas[idx + 2] = 0x18;
-            canvas[idx + 3] = 0xFF;
+        // A soft fold shadow at each card's hinge, instead of a hard line —
+        // darkens a small band that fades out above and below the hinge.
+        for &(x0, _, x1, _) in &self.card_rects {
+            draw_hinge_shadow(canvas, width, height, x0, x1, self.hinge_y, self.hinge_band);
+        }
+
+        // The colon: two plain dots in the black gap between the cards.
+        for &(cx, cy) in &self.colon_dots {
+            fill_circle(canvas, width, height, cx, cy, self.dot_radius, fg);
         }
 
         self.layer.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
@@ -308,6 +365,13 @@ impl App {
 
         self.layer.commit();
     }
+}
+
+/// Smoothstep easing: eases in and out, used to make the flip decelerate
+/// into place instead of moving at a constant linear rate.
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -378,9 +442,9 @@ fn draw_glyph_half(
                 continue;
             }
             let idx = (canvas_y as u32 * width + px as u32) as usize * 4;
-            // Blend from whatever's currently there (background, or an
-            // earlier-drawn layer) toward the digit color, weighted by
-            // this pixel's coverage — gives free antialiasing in any
+            // Blend from whatever's currently there (the card background,
+            // or an earlier-drawn layer) toward the digit color, weighted
+            // by this pixel's coverage — gives free antialiasing in any
             // configured color pair, not just white-on-black.
             let t = coverage as f32 / 255.0;
             canvas[idx] = lerp_u8(canvas[idx], fg.2, t);
@@ -393,6 +457,70 @@ fn draw_glyph_half(
 
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+/// Fills an axis-aligned rectangle with rounded corners. Standard
+/// "clamp to nearest corner center, test distance" technique: pixels in
+/// the straight top/bottom/left/right bands always pass (clamping puts the
+/// test center right on the pixel itself); only pixels in the four corner
+/// squares actually get a circular cutoff.
+#[allow(clippy::too_many_arguments)]
+fn fill_rounded_rect(canvas: &mut [u8], width: u32, height: u32, x0: i32, y0: i32, x1: i32, y1: i32, radius: i32, color: (u8, u8, u8)) {
+    let radius = radius.max(0);
+    for y in y0.max(0)..y1.min(height as i32) {
+        for x in x0.max(0)..x1.min(width as i32) {
+            let cx = x.clamp(x0 + radius, (x1 - radius).max(x0 + radius));
+            let cy = y.clamp(y0 + radius, (y1 - radius).max(y0 + radius));
+            let dx = x - cx;
+            let dy = y - cy;
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let idx = (y as u32 * width + x as u32) as usize * 4;
+            canvas[idx] = color.2;
+            canvas[idx + 1] = color.1;
+            canvas[idx + 2] = color.0;
+            canvas[idx + 3] = 0xFF;
+        }
+    }
+}
+
+/// Fills a filled circle — used for the colon dots.
+fn fill_circle(canvas: &mut [u8], width: u32, height: u32, cx: i32, cy: i32, radius: i32, color: (u8, u8, u8)) {
+    for y in (cy - radius).max(0)..(cy + radius + 1).min(height as i32) {
+        for x in (cx - radius).max(0)..(cx + radius + 1).min(width as i32) {
+            let dx = x - cx;
+            let dy = y - cy;
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let idx = (y as u32 * width + x as u32) as usize * 4;
+            canvas[idx] = color.2;
+            canvas[idx + 1] = color.1;
+            canvas[idx + 2] = color.0;
+            canvas[idx + 3] = 0xFF;
+        }
+    }
+}
+
+/// Darkens a band of `canvas` around `hinge_y` (within x0..x1), fading out
+/// toward the edges of the band — a soft fold shadow instead of a hard
+/// line, drawn on top of whatever's already there (card + digits).
+fn draw_hinge_shadow(canvas: &mut [u8], width: u32, height: u32, x0: i32, x1: i32, hinge_y: i32, band: i32) {
+    for dy in -band..=band {
+        let y = hinge_y + dy;
+        if y < 0 || y as u32 >= height {
+            continue;
+        }
+        let t = 1.0 - (dy.abs() as f32 / band as f32);
+        let darken = t * 0.55;
+        for x in x0.max(0)..x1.min(width as i32) {
+            let idx = (y as u32 * width + x as u32) as usize * 4;
+            canvas[idx] = (canvas[idx] as f32 * (1.0 - darken)) as u8;
+            canvas[idx + 1] = (canvas[idx + 1] as f32 * (1.0 - darken)) as u8;
+            canvas[idx + 2] = (canvas[idx + 2] as f32 * (1.0 - darken)) as u8;
+        }
+    }
 }
 
 impl CompositorHandler for App {

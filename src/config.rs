@@ -13,6 +13,11 @@ pub struct Config {
     pub digit_color: (u8, u8, u8),
     #[serde(deserialize_with = "deserialize_color")]
     pub background_color: (u8, u8, u8),
+    /// The flip-card panel color, distinct from the surrounding
+    /// background — this is what makes it read as physical cards sitting
+    /// on the desktop rather than digits floating in empty space.
+    #[serde(deserialize_with = "deserialize_color")]
+    pub card_color: (u8, u8, u8),
 }
 
 impl Default for Config {
@@ -21,6 +26,7 @@ impl Default for Config {
             hour_format: HourFormat::TwentyFour,
             digit_color: (0xFF, 0xFF, 0xFF),
             background_color: (0x00, 0x00, 0x00),
+            card_color: (0x16, 0x16, 0x16),
         }
     }
 }
