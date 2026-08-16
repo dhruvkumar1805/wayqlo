@@ -50,7 +50,7 @@ use wayland_client::{
 const FONT_DATA: &[u8] = include_bytes!("../assets/Oswald-Bold.ttf");
 
 // How long a single digit's flip animation takes, start to finish.
-const FLIP_DURATION: Duration = Duration::from_millis(350);
+const FLIP_DURATION: Duration = Duration::from_millis(260);
 
 // Even Oswald's condensed proportions leave the clock a bit short of a
 // screen's full height on standard 16:9 monitors (we're still width-bound
@@ -129,8 +129,6 @@ fn main() {
         hinge_y: 0,
         card_rects: [(0, 0, 0, 0); 2],
         card_radius: 0,
-        hinge_band: 0,
-        shadow_offset: 0,
         slots: std::array::from_fn(|i| DigitSlot { current: now_chars[DIGIT_POS[i]], anim: None }),
     };
 
@@ -202,10 +200,6 @@ struct App {
     // (x0, y0, x1, y1) for the hour-pair card and the minute-pair card.
     card_rects: [(i32, i32, i32, i32); 2],
     card_radius: i32,
-    // How many pixels above/below the hinge the fold shadow fades out over.
-    hinge_band: i32,
-    // Offset (both x and y) for the settled-digit drop shadow.
-    shadow_offset: i32,
 
     slots: [DigitSlot; 4],
 }
@@ -214,25 +208,36 @@ impl App {
     /// Rasterizes and caches every glyph we'll ever need, and computes the
     /// fixed on-screen card/slot layout. Called whenever the surface size
     /// is (re)established.
+    ///
+    /// Proportions here are taken directly from gluqlo's source
+    /// (gluqlo.c), not derived/guessed — gluqlo's cards are fixed SQUARES
+    /// sized off screen height alone, not width-driven rectangles sized to
+    /// fit their digits, which is what we were doing before and is why our
+    /// layout kept drifting from the reference no matter how much we
+    /// tuned padding ratios.
     fn layout(&mut self) {
-        // Start from a generous height-based size, then shrink it if that
-        // would overflow the available width — this way it always uses the
-        // largest size that actually fits THIS monitor's aspect ratio,
-        // rather than a single fixed ratio that's oversized on ultrawide
-        // screens and overflows on standard 16:9/16:10 ones.
-        let mut size = self.height as f32 * 1.3;
+        let h = self.height as f32;
+        let w = self.width as f32;
+
+        let rectsize = h * 0.6;
+        self.card_radius = (h * 0.05714).round() as i32;
+        let pair_gap = w * 0.031;
+
+        // Font size: pick the largest size where 2 digits + a small gap
+        // still fit inside the fixed-size square card, same two-pass
+        // shrink-if-needed idea as before, just bounded by the card's
+        // own width instead of the whole screen's.
+        let mut size = rectsize;
         for _ in 0..2 {
             self.glyphs.clear();
             for c in "0123456789".chars() {
                 self.glyphs.insert(c, self.font.rasterize(c, size));
             }
             let digit_width = self.glyphs[&'0'].0.advance_width * DIGIT_SQUEEZE;
-            let card_width = 2.0 * digit_width + size * 0.015 + 2.0 * (size * 0.03);
-            let total_width = 2.0 * card_width + size * 0.18;
-
-            let max_width = self.width as f32 * 0.99;
-            if total_width > max_width {
-                size *= max_width / total_width;
+            let inner_width = 2.0 * digit_width + size * 0.02;
+            let max_inner_width = rectsize * 0.88;
+            if inner_width > max_inner_width {
+                size *= max_inner_width / inner_width;
             } else {
                 break;
             }
@@ -241,48 +246,36 @@ impl App {
         let digit = &self.glyphs[&'0'].0;
         let digit_width = digit.advance_width * DIGIT_SQUEEZE;
         let glyph_height = digit.height as f32;
+        let digit_gap = size * 0.02;
 
-        let card_padding_x = size * 0.03;
-        let card_padding_y = size * 0.05;
-        let digit_gap = size * 0.015;
-        let pair_gap = size * 0.18;
-
-        let card_width = 2.0 * digit_width + digit_gap + 2.0 * card_padding_x;
-        let half_card_height = (glyph_height / 2.0 + card_padding_y).round() as i32;
-
-        let total_width = 2.0 * card_width + pair_gap;
-        let start_x = (self.width as f32 - total_width) / 2.0;
+        let total_width = 2.0 * rectsize + pair_gap;
+        let start_x = (w - total_width) / 2.0;
+        let start_y = (h - rectsize) / 2.0; // 20% top/bottom margin when rectsize = 0.6h
 
         let hour_x0 = start_x;
-        let hour_x1 = start_x + card_width;
+        let hour_x1 = start_x + rectsize;
         let minute_x0 = hour_x1 + pair_gap;
-        let minute_x1 = minute_x0 + card_width;
+        let minute_x1 = minute_x0 + rectsize;
 
-        self.slot_x[0] = hour_x0 + card_padding_x;
-        self.slot_x[1] = self.slot_x[0] + digit_width + digit_gap;
-        self.slot_x[2] = minute_x0 + card_padding_x;
-        self.slot_x[3] = self.slot_x[2] + digit_width + digit_gap;
+        // Center each digit pair on its card's horizontal midpoint.
+        let hour_center = hour_x0 + rectsize / 2.0;
+        let minute_center = minute_x0 + rectsize / 2.0;
+        self.slot_x[0] = hour_center - digit_width - digit_gap / 2.0;
+        self.slot_x[1] = hour_center + digit_gap / 2.0;
+        self.slot_x[2] = minute_center - digit_width - digit_gap / 2.0;
+        self.slot_x[3] = minute_center + digit_gap / 2.0;
 
         self.hinge_y = self.height as i32 / 2;
         // Center the glyph's actual vertical midpoint on the hinge, using
-        // real rasterized metrics instead of a guessed offset (size/3 was
-        // tuned by eye for the old font and left Oswald visibly off-center
-        // within its card — different fonts have different ymin/cap-height
-        // proportions, so this has to be derived per-font, not hardcoded).
-        // A glyph drawn at `baseline` spans canvas rows
+        // real rasterized metrics instead of a guessed offset — a glyph
+        // drawn at `baseline` spans canvas rows
         // [baseline - ymin - height, baseline - ymin), so its midpoint is
         // baseline - ymin - height/2; setting that equal to hinge_y and
         // solving for baseline gives this.
         self.baseline = self.hinge_y as f32 + digit.ymin as f32 + glyph_height / 2.0;
 
-        let card_top = self.hinge_y - half_card_height;
-        let card_bottom = self.hinge_y + half_card_height;
-        self.card_rects[0] = (hour_x0 as i32, card_top, hour_x1 as i32, card_bottom);
-        self.card_rects[1] = (minute_x0 as i32, card_top, minute_x1 as i32, card_bottom);
-        self.card_radius = (size * 0.08).round() as i32;
-        self.hinge_band = ((size * 0.06).round() as i32).max(2);
-
-        self.shadow_offset = (size * 0.012).round().max(1.0) as i32;
+        self.card_rects[0] = (hour_x0 as i32, start_y as i32, hour_x1 as i32, (start_y + rectsize) as i32);
+        self.card_rects[1] = (minute_x0 as i32, start_y as i32, minute_x1 as i32, (start_y + rectsize) as i32);
     }
 
     /// Checks the real clock and starts/advances/settles any flip
@@ -331,61 +324,19 @@ impl App {
             pixel.copy_from_slice(&[bg.2, bg.1, bg.0, 0xFF]);
         });
 
-        // The two card panels sit behind everything else — digits and the
-        // hinge shadow both draw on top of them. A hairline border (a
-        // slightly lighter ring, drawn first and then inset by the fill)
-        // gives each card a precise, "engineered object" edge instead of
-        // just fading straight into the black background.
-        let border_color = (
-            (self.card_color.0 as u16 + 14).min(255) as u8,
-            (self.card_color.1 as u16 + 14).min(255) as u8,
-            (self.card_color.2 as u16 + 14).min(255) as u8,
-        );
+        // The two card panels: a single flat fill, nothing more. Extra
+        // chrome (grain, borders, highlight lines, drop shadows) was tried
+        // and, compared directly against gluqlo's much plainer look,
+        // reads as clutter rather than "premium" — real flip-clock
+        // displays are this minimal on purpose.
         for &(x0, y0, x1, y1) in &self.card_rects {
-            fill_rounded_rect(canvas, width, height, x0, y0, x1, y1, self.card_radius, border_color);
-        }
-        for &(x0, y0, x1, y1) in &self.card_rects {
-            fill_rounded_rect(canvas, width, height, x0 + 1, y0 + 1, x1 - 1, y1 - 1, (self.card_radius - 1).max(0), self.card_color);
+            fill_rounded_rect(canvas, width, height, x0, y0, x1, y1, self.card_radius, self.card_color);
         }
 
-        // A subtle film-grain texture on each card — a flat vector fill
-        // reads as a UI panel; a very slight per-pixel brightness jitter
-        // reads as an actual physical material sitting under the light.
-        for &(x0, y0, x1, y1) in &self.card_rects {
-            apply_grain(canvas, width, height, x0, y0, x1, y1, 5.0);
-        }
-
-        // A faint top-edge highlight on each card — a hint of light
-        // catching a beveled edge, which reads as physical depth even
-        // though it's just one brighter line.
-        let highlight = (
-            (self.card_color.0 as u16 + 22).min(255) as u8,
-            (self.card_color.1 as u16 + 22).min(255) as u8,
-            (self.card_color.2 as u16 + 22).min(255) as u8,
-        );
-        for &(x0, y0, x1, _) in &self.card_rects {
-            for x in (x0 + self.card_radius).max(0)..(x1 - self.card_radius).min(width as i32) {
-                let y = y0 + 1;
-                if y < 0 || y as u32 >= height {
-                    continue;
-                }
-                let idx = (y as u32 * width + x as u32) as usize * 4;
-                canvas[idx] = highlight.2;
-                canvas[idx + 1] = highlight.1;
-                canvas[idx + 2] = highlight.0;
-            }
-        }
-
-        // A soft fold shadow at each card's hinge, instead of a hard line —
-        // darkens a small band that fades out above and below the hinge.
-        // Drawn BEFORE the digits (not after) so it only affects the card
-        // surface, not the digit ink itself — darkening on top of already-
-        // drawn glyphs created ugly blobby artifacts wherever the shadow
-        // band crossed a thin or curved stroke (the loop of a 6, the foot
-        // of a 1). The digits render cleanly on top of the (now slightly
-        // pre-darkened) card instead.
+        // The hinge: a thin black gap plus a light 1px line, matching
+        // gluqlo exactly. Drawn BEFORE the digits so it sits under them.
         for &(x0, _, x1, _) in &self.card_rects {
-            draw_hinge_shadow(canvas, width, height, x0, x1, self.hinge_y, self.hinge_band);
+            draw_hinge_line(canvas, width, height, x0, x1, self.hinge_y, height);
         }
 
         let fg = self.digit_color;
@@ -396,13 +347,6 @@ impl App {
             match slot.anim {
                 None => {
                     let (m, b) = &self.glyphs[&slot.current];
-                    // A soft offset shadow under the settled digit — gives
-                    // the typography actual lift off the card surface
-                    // instead of looking pasted flat onto it. Skipped
-                    // during an active flip (the fast motion there hides
-                    // its absence, and it'd need to follow both halves
-                    // through the animation for little visible benefit).
-                    draw_glyph_shadow(canvas, width, height, pen_x, self.baseline, m, b, self.shadow_offset, 0.35);
                     draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Top, 1.0, fg);
                     draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Bottom, 1.0, fg);
                 }
@@ -475,41 +419,6 @@ fn smoothstep(t: f32) -> f32 {
 enum Half {
     Top,
     Bottom,
-}
-
-/// Draws a soft, offset silhouette of a full (unsplit, unscaled) glyph at
-/// reduced opacity — a simple drop shadow that gives settled typography a
-/// bit of lift off the card surface instead of looking pasted flat onto
-/// it. Unlike draw_glyph_half, this always draws the complete glyph (no
-/// hinge split) since it's only used for non-animating digits.
-#[allow(clippy::too_many_arguments)]
-fn draw_glyph_shadow(canvas: &mut [u8], width: u32, height: u32, pen_x: f32, baseline: f32, metrics: &fontdue::Metrics, bitmap: &[u8], offset: i32, opacity: f32) {
-    for y in 0..metrics.height {
-        let canvas_y = baseline as i32 - metrics.ymin - metrics.height as i32 + y as i32 + offset;
-        if canvas_y < 0 || canvas_y as u32 >= height {
-            continue;
-        }
-        let squeezed_width = ((metrics.width as f32) * DIGIT_SQUEEZE).ceil() as i32;
-        for ox in 0..squeezed_width {
-            let src_x = (ox as f32 / DIGIT_SQUEEZE).round() as usize;
-            if src_x >= metrics.width {
-                continue;
-            }
-            let coverage = bitmap[y * metrics.width + src_x];
-            if coverage == 0 {
-                continue;
-            }
-            let px = pen_x as i32 + (metrics.xmin as f32 * DIGIT_SQUEEZE).round() as i32 + ox + offset;
-            if px < 0 || px as u32 >= width {
-                continue;
-            }
-            let idx = (canvas_y as u32 * width + px as u32) as usize * 4;
-            let t = (coverage as f32 / 255.0) * opacity;
-            canvas[idx] = lerp_u8(canvas[idx], 0, t);
-            canvas[idx + 1] = lerp_u8(canvas[idx + 1], 0, t);
-            canvas[idx + 2] = lerp_u8(canvas[idx + 2], 0, t);
-        }
-    }
 }
 
 /// Draws one half (top or bottom, split at `hinge_y`) of a rasterized
@@ -633,51 +542,40 @@ fn fill_rounded_rect(canvas: &mut [u8], width: u32, height: u32, x0: i32, y0: i3
     }
 }
 
-/// Darkens a band of `canvas` around `hinge_y` (within x0..x1), fading out
-/// toward the edges of the band — a soft fold shadow instead of a hard
-/// line, drawn on top of whatever's already there (card + digits).
-fn draw_hinge_shadow(canvas: &mut [u8], width: u32, height: u32, x0: i32, x1: i32, hinge_y: i32, band: i32) {
-    for dy in -band..=band {
-        let y = hinge_y + dy;
+/// Draws the hinge exactly as gluqlo does: a thin BLACK gap band (0.5% of
+/// screen height) at the split, followed immediately by a single 1px line
+/// in a fixed light grey (0x1a) — not a shadow gradient. The band is what
+/// actually reads as "two separate cards meeting," and the line beneath it
+/// is a subtle highlight, not a shadow (it's lighter than the card, not
+/// darker).
+fn draw_hinge_line(canvas: &mut [u8], width: u32, height: u32, x0: i32, x1: i32, hinge_y: i32, screen_height: u32) {
+    let band_h = ((screen_height as f32 * 0.005).round() as i32).max(1);
+    let band_y0 = hinge_y - band_h / 2;
+
+    for dy in 0..band_h {
+        let y = band_y0 + dy;
         if y < 0 || y as u32 >= height {
             continue;
         }
-        let t = 1.0 - (dy.abs() as f32 / band as f32);
-        let darken = t * 0.55;
+        let idx_row = y as u32 * width;
         for x in x0.max(0)..x1.min(width as i32) {
-            let idx = (y as u32 * width + x as u32) as usize * 4;
-            canvas[idx] = (canvas[idx] as f32 * (1.0 - darken)) as u8;
-            canvas[idx + 1] = (canvas[idx + 1] as f32 * (1.0 - darken)) as u8;
-            canvas[idx + 2] = (canvas[idx + 2] as f32 * (1.0 - darken)) as u8;
+            let idx = (idx_row + x as u32) as usize * 4;
+            canvas[idx] = 0;
+            canvas[idx + 1] = 0;
+            canvas[idx + 2] = 0;
         }
     }
-}
 
-/// Adds a subtle, deterministic per-pixel brightness jitter within a
-/// rectangle — a flat color fill reads as a vector UI panel; a slight
-/// grain reads as an actual physical material under light. Deterministic
-/// (same noise value for a given x,y every frame) so it doesn't shimmer
-/// like TV static — it's meant to be felt, not really "seen".
-fn apply_grain(canvas: &mut [u8], width: u32, height: u32, x0: i32, y0: i32, x1: i32, y1: i32, strength: f32) {
-    for y in y0.max(0)..y1.min(height as i32) {
+    let line_y = band_y0 + band_h;
+    if line_y >= 0 && (line_y as u32) < height {
+        let idx_row = line_y as u32 * width;
         for x in x0.max(0)..x1.min(width as i32) {
-            let n = grain_noise(x, y) * strength;
-            let idx = (y as u32 * width + x as u32) as usize * 4;
-            canvas[idx] = (canvas[idx] as f32 + n).clamp(0.0, 255.0) as u8;
-            canvas[idx + 1] = (canvas[idx + 1] as f32 + n).clamp(0.0, 255.0) as u8;
-            canvas[idx + 2] = (canvas[idx + 2] as f32 + n).clamp(0.0, 255.0) as u8;
+            let idx = (idx_row + x as u32) as usize * 4;
+            canvas[idx] = 0x1a;
+            canvas[idx + 1] = 0x1a;
+            canvas[idx + 2] = 0x1a;
         }
     }
-}
-
-/// A cheap deterministic pseudo-random value in [-1, 1] for integer pixel
-/// coordinates — an integer hash, not an actual RNG, so no state to carry
-/// around and the same (x,y) always gives the same value.
-fn grain_noise(x: i32, y: i32) -> f32 {
-    let n = (x.wrapping_mul(374761393).wrapping_add(y.wrapping_mul(668265263))) as u32;
-    let n = (n ^ (n >> 13)).wrapping_mul(1274126177);
-    let v = (n >> 8) & 0xFFFF;
-    (v as f32 / 65535.0) * 2.0 - 1.0
 }
 
 impl CompositorHandler for App {

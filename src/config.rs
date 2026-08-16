@@ -24,12 +24,13 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             hour_format: HourFormat::TwentyFour,
-            // A soft, slightly warm grey rather than pure white — this is
-            // the tone real Fliqlo actually uses; pure white read as too
-            // stark/clinical against the dark card.
-            digit_color: (0xB8, 0xB8, 0xB8),
+            // Exact values from gluqlo.c's FONT_COLOR / BACKGROUND_COLOR
+            // constants (gluqlo is a deliberate Fliqlo clone, so these are
+            // as close to real Fliqlo's actual palette as we can get
+            // without the original source).
+            digit_color: (0xB7, 0xB7, 0xB7),
             background_color: (0x00, 0x00, 0x00),
-            card_color: (0x16, 0x16, 0x16),
+            card_color: (0x0F, 0x0F, 0x0F),
         }
     }
 }
