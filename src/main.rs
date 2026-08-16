@@ -36,24 +36,21 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-// Inter ExtraBold (OFL-1.1 licensed, see assets/Inter-LICENSE.txt), baked
+// Oswald Bold (OFL-1.1 licensed, see assets/Oswald-LICENSE.txt), baked
 // directly into the binary at compile time via include_bytes!. No runtime
 // filesystem dependency on a specific font package being installed — the
-// executable is fully self-contained.
-const FONT_DATA: &[u8] = include_bytes!("../assets/Inter-ExtraBold.ttf");
+// executable is fully self-contained. Oswald is a genuinely condensed
+// typeface by design (unlike our first attempt, Inter ExtraBold, which we
+// tried to force-narrow with a horizontal scale hack — that just made the
+// strokes look unevenly stretched, since squeezing only one axis distorts
+// a typeface that wasn't designed for it). A real condensed face keeps its
+// stroke proportions consistent while still being narrow enough that 4
+// digits comfortably fit a 16:9 screen's width with plenty of height to
+// spare — which is what actually lets the clock get big like real Fliqlo.
+const FONT_DATA: &[u8] = include_bytes!("../assets/Oswald-Bold.ttf");
 
 // How long a single digit's flip animation takes, start to finish.
 const FLIP_DURATION: Duration = Duration::from_millis(350);
-
-// Inter's natural digit proportions are too WIDE relative to their height
-// to let the clock get big on a standard 16:9 monitor — 4 digits at full
-// width hit the screen's width limit long before using much of its
-// height. Real Fliqlo's numerals are visibly condensed (tall, narrow).
-// Squeezing horizontally during rendering (not swapping fonts) gets the
-// same effect: less width per digit means `size` can grow much larger
-// before hitting the width ceiling, which grows the height too since
-// they're both derived from the same `size`.
-const DIGIT_SQUEEZE: f32 = 0.62;
 
 // Index into the formatted "HH:MM" time string for each of our 4 digit
 // slots (H, H, M, M) — index 2 (the ':') is skipped since it's drawn
@@ -224,11 +221,11 @@ impl App {
             for c in "0123456789".chars() {
                 self.glyphs.insert(c, self.font.rasterize(c, size));
             }
-            let digit_width = self.glyphs[&'0'].0.advance_width * DIGIT_SQUEEZE;
+            let digit_width = self.glyphs[&'0'].0.advance_width;
             let card_width = 2.0 * digit_width + size * 0.02 + 2.0 * (size * 0.04);
-            let total_width = 2.0 * card_width + size * 0.15;
+            let total_width = 2.0 * card_width + size * 0.22;
 
-            let max_width = self.width as f32 * 0.98;
+            let max_width = self.width as f32 * 0.96;
             if total_width > max_width {
                 size *= max_width / total_width;
             } else {
@@ -237,13 +234,13 @@ impl App {
         }
 
         let digit = &self.glyphs[&'0'].0;
-        let digit_width = digit.advance_width * DIGIT_SQUEEZE;
+        let digit_width = digit.advance_width;
         let glyph_height = digit.height as f32;
 
         let card_padding_x = size * 0.04;
         let card_padding_y = size * 0.05;
         let digit_gap = size * 0.02;
-        let pair_gap = size * 0.15;
+        let pair_gap = size * 0.22;
 
         let card_width = 2.0 * digit_width + digit_gap + 2.0 * card_padding_x;
         let half_card_height = (glyph_height / 2.0 + card_padding_y).round() as i32;
@@ -261,8 +258,17 @@ impl App {
         self.slot_x[2] = minute_x0 + card_padding_x;
         self.slot_x[3] = self.slot_x[2] + digit_width + digit_gap;
 
-        self.baseline = self.height as f32 / 2.0 + size / 3.0;
         self.hinge_y = self.height as i32 / 2;
+        // Center the glyph's actual vertical midpoint on the hinge, using
+        // real rasterized metrics instead of a guessed offset (size/3 was
+        // tuned by eye for the old font and left Oswald visibly off-center
+        // within its card — different fonts have different ymin/cap-height
+        // proportions, so this has to be derived per-font, not hardcoded).
+        // A glyph drawn at `baseline` spans canvas rows
+        // [baseline - ymin - height, baseline - ymin), so its midpoint is
+        // baseline - ymin - height/2; setting that equal to hinge_y and
+        // solving for baseline gives this.
+        self.baseline = self.hinge_y as f32 + digit.ymin as f32 + glyph_height / 2.0;
 
         let card_top = self.hinge_y - half_card_height;
         let card_bottom = self.hinge_y + half_card_height;
@@ -373,6 +379,18 @@ impl App {
             }
         }
 
+        // A soft fold shadow at each card's hinge, instead of a hard line —
+        // darkens a small band that fades out above and below the hinge.
+        // Drawn BEFORE the digits (not after) so it only affects the card
+        // surface, not the digit ink itself — darkening on top of already-
+        // drawn glyphs created ugly blobby artifacts wherever the shadow
+        // band crossed a thin or curved stroke (the loop of a 6, the foot
+        // of a 1). The digits render cleanly on top of the (now slightly
+        // pre-darkened) card instead.
+        for &(x0, _, x1, _) in &self.card_rects {
+            draw_hinge_shadow(canvas, width, height, x0, x1, self.hinge_y, self.hinge_band);
+        }
+
         let fg = self.digit_color;
         for i in 0..4 {
             let pen_x = self.slot_x[i];
@@ -421,12 +439,6 @@ impl App {
                     }
                 }
             }
-        }
-
-        // A soft fold shadow at each card's hinge, instead of a hard line —
-        // darkens a small band that fades out above and below the hinge.
-        for &(x0, _, x1, _) in &self.card_rects {
-            draw_hinge_shadow(canvas, width, height, x0, x1, self.hinge_y, self.hinge_band);
         }
 
         // The colon: two accent-colored dots, each with a small pilot-light
@@ -531,21 +543,12 @@ fn draw_glyph_half(
             continue;
         }
 
-        // Condense horizontally: walk OUTPUT columns (narrower than the
-        // source glyph by DIGIT_SQUEEZE) and sample back into the source
-        // bitmap, same nearest-neighbor idea as the vertical flip scaling
-        // above, just applied on every draw instead of only during a flip.
-        let squeezed_width = ((metrics.width as f32) * DIGIT_SQUEEZE).ceil() as i32;
-        for ox in 0..squeezed_width {
-            let src_x = (ox as f32 / DIGIT_SQUEEZE).round() as usize;
-            if src_x >= metrics.width {
-                continue;
-            }
-            let coverage = bitmap[src_row as usize * metrics.width + src_x];
+        for x in 0..metrics.width {
+            let coverage = bitmap[src_row as usize * metrics.width + x];
             if coverage == 0 {
                 continue;
             }
-            let px = pen_x as i32 + (metrics.xmin as f32 * DIGIT_SQUEEZE).round() as i32 + ox;
+            let px = pen_x as i32 + metrics.xmin + x as i32;
             if px < 0 || px as u32 >= width {
                 continue;
             }
