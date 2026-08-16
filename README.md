@@ -12,22 +12,29 @@ framework.
 - Configurable colors and 12/24 hour format
 - Single self-contained binary, font included at compile time
 
-## Building from source
+## Installing
 
 Requires a Rust toolchain (`cargo`).
 
 ```sh
 git clone https://github.com/dhruvkumar1805/wayqlo.git
 cd wayqlo
-cargo build --release
+./install.sh
 ```
 
-The binary is at `target/release/wayqlo`. Copy it somewhere on your `PATH`,
-for example:
+This builds the release binary, installs it to `~/.local/bin/wayqlo`, and
+wires it into your idle daemon automatically:
 
-```sh
-install -Dm755 target/release/wayqlo ~/.local/bin/wayqlo
-```
+- **Omarchy:** takes over the existing screensaver hook in
+  `hypridle.conf` (backs the file up first).
+- **Plain Hyprland (hypridle):** appends a listener block to
+  `hypridle.conf` if one is not already there (backs the file up first).
+- **Sway (swayidle):** sway configs vary too much to edit safely, so it
+  prints the line to add yourself. See `contrib/swayidle.sh`.
+
+Safe to re-run, every check is idempotent. If you would rather do it by
+hand, build with `cargo build --release` and see `contrib/` for the raw
+config snippets.
 
 ## Running
 
@@ -49,18 +56,6 @@ out falls back to its default. See `contrib/config.toml` for a full example.
 | `digit_color`        | `"#B7B7B7"` | Digit color, as `#RRGGBB`      |
 | `background_color`   | `"#000000"` | Screen background color        |
 | `card_color`         | `"#0F0F0F"` | Flip card panel color          |
-
-## Idle daemon integration
-
-wayqlo does not run as a daemon itself. Have your idle manager launch it
-after a timeout instead.
-
-**Hyprland (hypridle):** see `contrib/hypridle.conf`.
-
-**Sway (swayidle):** see `contrib/swayidle.sh`.
-
-Both call `wayqlo` on timeout and `pkill wayqlo` on resume, as a safety net
-in case it is still running when the session wakes up some other way.
 
 ## License
 
