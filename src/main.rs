@@ -204,12 +204,10 @@ impl App {
     /// fixed on-screen card/slot layout. Called whenever the surface size
     /// is (re)established.
     ///
-    /// Proportions here are taken directly from gluqlo's source
-    /// (gluqlo.c), not derived/guessed — gluqlo's cards are fixed SQUARES
-    /// sized off screen height alone, not width-driven rectangles sized to
-    /// fit their digits, which is what we were doing before and is why our
-    /// layout kept drifting from the reference no matter how much we
-    /// tuned padding ratios.
+    /// Each card is a fixed SQUARE sized off screen height alone, not a
+    /// width-driven rectangle sized to fit its digits (an earlier version
+    /// did that, and the proportions kept drifting no matter how much the
+    /// padding ratios were tuned).
     fn layout(&mut self) {
         let h = self.height as f32;
         let w = self.width as f32;
@@ -321,15 +319,14 @@ impl App {
 
         // The two card panels: a single flat fill, nothing more. Extra
         // chrome (grain, borders, highlight lines, drop shadows) was tried
-        // and, compared directly against gluqlo's much plainer look,
-        // reads as clutter rather than "premium" — real flip-clock
+        // and reads as clutter rather than "premium" — real flip-clock
         // displays are this minimal on purpose.
         for &(x0, y0, x1, y1) in &self.card_rects {
             fill_rounded_rect(canvas, width, height, x0, y0, x1, y1, self.card_radius, self.card_color);
         }
 
-        // The hinge: a thin black gap plus a light 1px line, matching
-        // gluqlo exactly. Drawn BEFORE the digits so it sits under them.
+        // The hinge: a thin black gap plus a light 1px line, not a shadow
+        // gradient. Drawn BEFORE the digits so it sits under them.
         for &(x0, _, x1, _) in &self.card_rects {
             draw_hinge_line(canvas, width, height, x0, x1, self.hinge_y, height);
         }
@@ -532,10 +529,10 @@ fn fill_rounded_rect(canvas: &mut [u8], width: u32, height: u32, x0: i32, y0: i3
     }
 }
 
-/// Draws the hinge exactly as gluqlo does: a thin BLACK gap band (0.5% of
-/// screen height) at the split, followed immediately by a single 1px line
-/// in a fixed light grey (0x1a) — not a shadow gradient. The band is what
-/// actually reads as "two separate cards meeting," and the line beneath it
+/// Draws the hinge as a thin BLACK gap band (0.5% of screen height) at the
+/// split, followed immediately by a single 1px line in a fixed light grey
+/// (0x1a) — not a shadow gradient. The band is what actually reads as
+/// "two separate cards meeting," and the line beneath it
 /// is a subtle highlight, not a shadow (it's lighter than the card, not
 /// darker).
 fn draw_hinge_line(canvas: &mut [u8], width: u32, height: u32, x0: i32, x1: i32, hinge_y: i32, screen_height: u32) {
@@ -623,8 +620,8 @@ impl ShmHandler for App {
     }
 }
 
-// Dismiss-on-any-input, matching gluqlo's `-anykeyclose`: grab keyboard and
-// pointer devices as they show up, and exit on the first real interaction.
+// Dismiss-on-any-input: grab keyboard and pointer devices as they show
+// up, and exit on the first real interaction.
 impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state

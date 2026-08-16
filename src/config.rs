@@ -24,10 +24,9 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             hour_format: HourFormat::TwentyFour,
-            // Exact values from gluqlo.c's FONT_COLOR / BACKGROUND_COLOR
-            // constants (gluqlo is a deliberate Fliqlo clone, so these are
-            // as close to real Fliqlo's actual palette as we can get
-            // without the original source).
+            // A soft, warm grey rather than pure white. Flip clocks
+            // traditionally print digits in a muted grey ink, not stark
+            // white, and it reads as calmer against the dark card.
             digit_color: (0xB7, 0xB7, 0xB7),
             background_color: (0x00, 0x00, 0x00),
             card_color: (0x0F, 0x0F, 0x0F),

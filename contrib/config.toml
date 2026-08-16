@@ -1,0 +1,10 @@
+# Example wayqlo config. Copy to ~/.config/wayqlo/config.toml and edit.
+# Any field you omit falls back to its default shown below.
+
+# "12" or "24"
+hour_format = "24"
+
+# Colors as "#RRGGBB"
+digit_color = "#B7B7B7"
+background_color = "#000000"
+card_color = "#0F0F0F"
