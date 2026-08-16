@@ -100,6 +100,7 @@ fn main() {
         digit_color: config.digit_color,
         background_color: config.background_color,
         card_color: config.card_color,
+        accent_color: config.accent_color,
         width: 0,
         height: 0,
         first_configure: true,
@@ -166,6 +167,7 @@ struct App {
     digit_color: (u8, u8, u8),
     background_color: (u8, u8, u8),
     card_color: (u8, u8, u8),
+    accent_color: (u8, u8, u8),
     width: u32,
     height: u32,
     first_configure: bool,
@@ -300,6 +302,13 @@ impl App {
             fill_rounded_rect(canvas, width, height, x0, y0, x1, y1, self.card_radius, self.card_color);
         }
 
+        // A subtle film-grain texture on each card — a flat vector fill
+        // reads as a UI panel; a very slight per-pixel brightness jitter
+        // reads as an actual physical material sitting under the light.
+        for &(x0, y0, x1, y1) in &self.card_rects {
+            apply_grain(canvas, width, height, x0, y0, x1, y1, 5.0);
+        }
+
         // A faint top-edge highlight on each card — a hint of light
         // catching a beveled edge, which reads as physical depth even
         // though it's just one brighter line.
@@ -318,6 +327,22 @@ impl App {
                 canvas[idx] = highlight.2;
                 canvas[idx + 1] = highlight.1;
                 canvas[idx + 2] = highlight.0;
+            }
+        }
+
+        // A thin warm rim-light along each card's bottom edge, in the
+        // accent color — the counterpart to the cool white top highlight,
+        // as if the card is catching warm reflected light from below.
+        for &(x0, _, x1, y1) in &self.card_rects {
+            let y = y1 - 2;
+            if y < 0 || y as u32 >= height {
+                continue;
+            }
+            for x in (x0 + self.card_radius).max(0)..(x1 - self.card_radius).min(width as i32) {
+                let idx = (y as u32 * width + x as u32) as usize * 4;
+                canvas[idx] = lerp_u8(canvas[idx], self.accent_color.2, 0.3);
+                canvas[idx + 1] = lerp_u8(canvas[idx + 1], self.accent_color.1, 0.3);
+                canvas[idx + 2] = lerp_u8(canvas[idx + 2], self.accent_color.0, 0.3);
             }
         }
 
@@ -365,9 +390,11 @@ impl App {
             draw_hinge_shadow(canvas, width, height, x0, x1, self.hinge_y, self.hinge_band);
         }
 
-        // The colon: two plain dots in the black gap between the cards.
+        // The colon: two accent-colored dots, each with a small pilot-light
+        // glow, in the black gap between the cards.
         for &(cx, cy) in &self.colon_dots {
-            fill_circle(canvas, width, height, cx, cy, self.dot_radius, fg);
+            draw_radial_glow(canvas, width, height, cx as f32, cy as f32, self.dot_radius as f32 * 3.0, self.accent_color, 0.5);
+            fill_circle(canvas, width, height, cx, cy, self.dot_radius, self.accent_color);
         }
 
         self.layer.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
@@ -554,6 +581,70 @@ fn draw_hinge_shadow(canvas: &mut [u8], width: u32, height: u32, x0: i32, x1: i3
             canvas[idx + 2] = (canvas[idx + 2] as f32 * (1.0 - darken)) as u8;
         }
     }
+}
+
+/// Blends `color` into a soft circular falloff centered at (cx, cy):
+/// strongest at the center (`peak` is the max blend amount, 0..1) fading to
+/// nothing at `radius`. Used for the ambient glow behind the clock and the
+/// small pilot-light glow behind each colon dot — a light source is the
+/// single easiest way to make a flat 2D scene stop looking flat.
+fn draw_radial_glow(canvas: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, radius: f32, color: (u8, u8, u8), peak: f32) {
+    if radius <= 0.0 {
+        return;
+    }
+    let x0 = (cx - radius).floor().max(0.0) as i32;
+    let x1 = (cx + radius).ceil().min(width as f32) as i32;
+    let y0 = (cy - radius).floor().max(0.0) as i32;
+    let y1 = (cy + radius).ceil().min(height as f32) as i32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist > radius {
+                continue;
+            }
+            // Quadratic falloff reads as a softer, more natural glow than
+            // a linear fade — most of the brightness stays near the
+            // center instead of ramping evenly all the way to the edge.
+            let t = 1.0 - dist / radius;
+            let alpha = peak * t * t;
+            if alpha <= 0.0 {
+                continue;
+            }
+            let idx = (y as u32 * width + x as u32) as usize * 4;
+            canvas[idx] = lerp_u8(canvas[idx], color.2, alpha);
+            canvas[idx + 1] = lerp_u8(canvas[idx + 1], color.1, alpha);
+            canvas[idx + 2] = lerp_u8(canvas[idx + 2], color.0, alpha);
+        }
+    }
+}
+
+/// Adds a subtle, deterministic per-pixel brightness jitter within a
+/// rectangle — a flat color fill reads as a vector UI panel; a slight
+/// grain reads as an actual physical material under light. Deterministic
+/// (same noise value for a given x,y every frame) so it doesn't shimmer
+/// like TV static — it's meant to be felt, not really "seen".
+fn apply_grain(canvas: &mut [u8], width: u32, height: u32, x0: i32, y0: i32, x1: i32, y1: i32, strength: f32) {
+    for y in y0.max(0)..y1.min(height as i32) {
+        for x in x0.max(0)..x1.min(width as i32) {
+            let n = grain_noise(x, y) * strength;
+            let idx = (y as u32 * width + x as u32) as usize * 4;
+            canvas[idx] = (canvas[idx] as f32 + n).clamp(0.0, 255.0) as u8;
+            canvas[idx + 1] = (canvas[idx + 1] as f32 + n).clamp(0.0, 255.0) as u8;
+            canvas[idx + 2] = (canvas[idx + 2] as f32 + n).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// A cheap deterministic pseudo-random value in [-1, 1] for integer pixel
+/// coordinates — an integer hash, not an actual RNG, so no state to carry
+/// around and the same (x,y) always gives the same value.
+fn grain_noise(x: i32, y: i32) -> f32 {
+    let n = (x.wrapping_mul(374761393).wrapping_add(y.wrapping_mul(668265263))) as u32;
+    let n = (n ^ (n >> 13)).wrapping_mul(1274126177);
+    let v = (n >> 8) & 0xFFFF;
+    (v as f32 / 65535.0) * 2.0 - 1.0
 }
 
 impl CompositorHandler for App {

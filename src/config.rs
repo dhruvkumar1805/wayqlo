@@ -18,6 +18,12 @@ pub struct Config {
     /// on the desktop rather than digits floating in empty space.
     #[serde(deserialize_with = "deserialize_color")]
     pub card_color: (u8, u8, u8),
+    /// A signature color carried through the colon dots, the ambient
+    /// glow behind the clock, and a thin warm rim-light along each
+    /// card's bottom edge — this is what gives the piece an identity
+    /// instead of reading as generic monochrome grey-on-black.
+    #[serde(deserialize_with = "deserialize_color")]
+    pub accent_color: (u8, u8, u8),
 }
 
 impl Default for Config {
@@ -27,6 +33,7 @@ impl Default for Config {
             digit_color: (0xFF, 0xFF, 0xFF),
             background_color: (0x00, 0x00, 0x00),
             card_color: (0x16, 0x16, 0x16),
+            accent_color: (0xFF, 0x8A, 0x4C),
         }
     }
 }
