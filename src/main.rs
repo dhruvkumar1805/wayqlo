@@ -119,14 +119,14 @@ fn main() {
     // often as the compositor is ready to show a new frame.
     loop_handle
         .insert_source(Timer::immediate(), |_deadline, _, app| {
-            let now_chars: Vec<char> = app.hour_format.format_now().chars().collect();
+            let now_chars = app.hour_format.format_now();
             for output in &mut app.outputs {
                 // Guard against firing before the first `configure` event
                 // has arrived (width/height still 0, glyph cache still
                 // empty).
                 if output.width > 0 && output.height > 0 && !output.animating {
                     output.advance(&now_chars);
-                    output.draw(&app.qh, app.digit_color, app.background_color, app.card_color);
+                    output.draw(&app.qh, app.digit_color, app.card_color);
                 }
             }
             TimeoutAction::ToDuration(Duration::from_millis(300))
@@ -215,6 +215,13 @@ struct OutputSurface {
     // background behind it.
     glow_center: (f32, f32),
     glow_half: (f32, f32),
+    // The background fill plus its ambient bloom, rendered once here
+    // instead of per pixel on every single frame: neither depends on
+    // anything that changes between draws (colors and screen size are
+    // both fixed once the surface is configured), so recomputing a
+    // sqrt-and-smoothstep gradient across ~2 million pixels 60 times a
+    // second during a flip would be pure waste. `draw` just blits this.
+    background_buf: Vec<u8>,
     // Precomputed, fixed x position for each of the 4 digit slots, so
     // digits don't jitter horizontally as they change width.
     slot_x: [f32; 4],
@@ -255,6 +262,7 @@ impl OutputSurface {
             glow_glyphs: HashMap::new(),
             glow_center: (0.0, 0.0),
             glow_half: (1.0, 1.0),
+            background_buf: Vec::new(),
             slot_x: [0.0; 4],
             hour_center: 0.0,
             baseline: 0.0,
@@ -277,7 +285,7 @@ impl OutputSurface {
     /// width-driven rectangle sized to fit its digits (an earlier version
     /// did that, and the proportions kept drifting no matter how much the
     /// padding ratios were tuned).
-    fn layout(&mut self, font: &fontdue::Font) {
+    fn layout(&mut self, font: &fontdue::Font, digit_color: (u8, u8, u8), background_color: (u8, u8, u8)) {
         let h = self.height as f32;
         let w = self.width as f32;
 
@@ -400,6 +408,8 @@ impl OutputSurface {
         let clock_y1 = self.card_rects[0].3 as f32;
         self.glow_center = ((clock_x0 + clock_x1) / 2.0, (clock_y0 + clock_y1) / 2.0);
         self.glow_half = (((clock_x1 - clock_x0) / 2.0).max(1.0), ((clock_y1 - clock_y0) / 2.0).max(1.0));
+
+        self.background_buf = render_background(self.width, self.height, self.glow_center, self.glow_half, digit_color, background_color);
     }
 
     /// Checks the real clock and starts/advances/settles any flip
@@ -431,7 +441,7 @@ impl OutputSurface {
         self.animating = animating;
     }
 
-    fn draw(&mut self, qh: &QueueHandle<App>, digit_color: (u8, u8, u8), background_color: (u8, u8, u8), card_color: (u8, u8, u8)) {
+    fn draw(&mut self, qh: &QueueHandle<App>, digit_color: (u8, u8, u8), card_color: (u8, u8, u8)) {
         let (width, height) = (self.width, self.height);
         let stride = width as i32 * 4;
 
@@ -440,28 +450,11 @@ impl OutputSurface {
             .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
             .expect("create buffer");
 
-        // Background fill, plus a soft ambient bloom bleeding outward from
-        // the clock: it reads as the clock actually lighting the dark
-        // room around it rather than sitting flat on top of it. Strongest
-        // right at the clock's own bounding box, fully gone by 2.6x its
-        // half-extent.
-        let bg = background_color;
-        let (gcx, gcy) = self.glow_center;
-        let (ghx, ghy) = self.glow_half;
-        for y in 0..height {
-            for x in 0..width {
-                let dx = (x as f32 - gcx) / ghx;
-                let dy = (y as f32 - gcy) / ghy;
-                let nd = (dx * dx + dy * dy).sqrt();
-                let t = ((nd - 1.0) / 1.6).clamp(0.0, 1.0);
-                let glow = (1.0 - smoothstep(t)) * 0.10;
-                let idx = (y * width + x) as usize * 4;
-                canvas[idx] = lerp_u8(bg.2, digit_color.2, glow);
-                canvas[idx + 1] = lerp_u8(bg.1, digit_color.1, glow);
-                canvas[idx + 2] = lerp_u8(bg.0, digit_color.0, glow);
-                canvas[idx + 3] = 0xFF;
-            }
-        }
+        // Background fill plus its ambient bloom: precomputed once in
+        // layout() since neither depends on anything that changes between
+        // frames, so every draw just copies it in instead of re-walking
+        // every pixel with a sqrt and a smoothstep.
+        canvas[..self.background_buf.len()].copy_from_slice(&self.background_buf);
 
         // The two card panels: a single flat fill, nothing more. Extra
         // chrome (grain, borders, highlight lines, drop shadows) was tried
@@ -734,8 +727,37 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
+/// Renders the flat background plus its ambient bloom into a fresh ARGB
+/// buffer: a soft glow bleeding outward from the clock's own bounding
+/// box, strongest right at its edge and fully gone by 2.6x its
+/// half-extent, so it reads as the clock lighting the dark room around
+/// it. Called once per layout (screen size and colors are both fixed
+/// once the surface is configured), not per frame.
+fn render_background(width: u32, height: u32, glow_center: (f32, f32), glow_half: (f32, f32), digit_color: (u8, u8, u8), background_color: (u8, u8, u8)) -> Vec<u8> {
+    let (gcx, gcy) = glow_center;
+    let (ghx, ghy) = glow_half;
+    let bg = background_color;
+    let mut buf = vec![0u8; width as usize * height as usize * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let dx = (x as f32 - gcx) / ghx;
+            let dy = (y as f32 - gcy) / ghy;
+            let nd = (dx * dx + dy * dy).sqrt();
+            let t = ((nd - 1.0) / 1.6).clamp(0.0, 1.0);
+            let glow = (1.0 - smoothstep(t)) * 0.10;
+            let idx = (y * width + x) as usize * 4;
+            buf[idx] = lerp_u8(bg.2, digit_color.2, glow);
+            buf[idx + 1] = lerp_u8(bg.1, digit_color.1, glow);
+            buf[idx + 2] = lerp_u8(bg.0, digit_color.0, glow);
+            buf[idx + 3] = 0xFF;
+        }
+    }
+    buf
+}
+
 /// Draws a whole rasterized glyph at full size, no hinge split. Used for
-/// the small AM/PM label, which doesn't flip.
+/// the small AM/PM label, which doesn't flip, and for the digit glow.
+#[allow(clippy::too_many_arguments)]
 fn draw_glyph(canvas: &mut [u8], width: u32, height: u32, pen_x: f32, baseline: f32, metrics: &fontdue::Metrics, bitmap: &[u8], fg: (u8, u8, u8)) {
     if metrics.width == 0 || metrics.height == 0 {
         return;
@@ -902,14 +924,14 @@ impl CompositorHandler for App {
         // redraw. draw() itself will ask for another frame callback if
         // still animating afterward, keeping this loop going at the
         // compositor's own pace.
-        let now_chars: Vec<char> = self.hour_format.format_now().chars().collect();
-        let (digit_color, background_color, card_color) = (self.digit_color, self.background_color, self.card_color);
+        let now_chars = self.hour_format.format_now();
+        let (digit_color, card_color) = (self.digit_color, self.card_color);
         let qh = self.qh.clone();
-        if let Some(output) = self.output_surface_for(surface) {
-            if output.animating {
-                output.advance(&now_chars);
-                output.draw(&qh, digit_color, background_color, card_color);
-            }
+        if let Some(output) = self.output_surface_for(surface)
+            && output.animating
+        {
+            output.advance(&now_chars);
+            output.draw(&qh, digit_color, card_color);
         }
     }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
@@ -942,7 +964,7 @@ impl OutputHandler for App {
 
         let pool = SlotPool::new(1, &self.shm).expect("failed to create shm pool");
 
-        let now_chars: Vec<char> = self.hour_format.format_now().chars().collect();
+        let now_chars = self.hour_format.format_now();
         self.outputs.push(OutputSurface::new(wl_output, layer, pool, &now_chars, self.show_meridiem));
     }
 
@@ -977,10 +999,10 @@ impl LayerShellHandler for App {
         if let Some(output) = self.outputs.iter_mut().find(|o| &o.layer == layer) {
             output.width = configure.new_size.0;
             output.height = configure.new_size.1;
-            output.layout(font);
+            output.layout(font, digit_color, background_color);
             if output.first_configure {
                 output.first_configure = false;
-                output.draw(&qh, digit_color, background_color, card_color);
+                output.draw(&qh, digit_color, card_color);
             }
         }
     }

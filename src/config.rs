@@ -1,3 +1,4 @@
+use chrono::Timelike;
 use serde::Deserialize;
 
 /// User-facing settings, loaded from ~/.config/wayqlo/config.toml.
@@ -44,22 +45,29 @@ pub enum HourFormat {
 
 impl HourFormat {
     /// Formats the current time as exactly 5 characters (H H : M M), which
-    /// is what the fixed 4-digit-slot layout requires.
+    /// is what the fixed 4-digit-slot layout requires. Computed straight
+    /// from `Timelike` accessors rather than chrono's string formatter:
+    /// this runs on every animation frame while a flip is in progress (up
+    /// to 60 times a second), and formatting-then-parsing a string on
+    /// that path would allocate for no reason.
     ///
     /// In 12-hour mode the hour is space-padded rather than zero-padded (a
     /// lone "7", not "07"): real flip clocks with a two-flap hour card
     /// leave the tens flap blank rather than printing a leading zero, and
     /// a space character rasterizes to an empty glyph, so the blank flap
     /// falls out of the normal digit-rendering path for free.
-    pub fn format_now(self) -> String {
+    pub fn format_now(self) -> [char; 5] {
         let now = chrono::Local::now();
-        match self {
-            HourFormat::TwentyFour => now.format("%H:%M").to_string(),
-            HourFormat::Twelve => {
-                let hour12: u32 = now.format("%I").to_string().parse().expect("chrono %I is always numeric");
-                format!("{hour12:2}:{}", now.format("%M"))
-            }
-        }
+        let (hour, zero_pad_hour) = match self {
+            HourFormat::TwentyFour => (now.hour(), true),
+            HourFormat::Twelve => (now.hour12().1, false),
+        };
+        let minute = now.minute();
+        let h_tens = if zero_pad_hour || hour >= 10 { char::from_digit(hour / 10, 10).unwrap() } else { ' ' };
+        let h_ones = char::from_digit(hour % 10, 10).unwrap();
+        let m_tens = char::from_digit(minute / 10, 10).unwrap();
+        let m_ones = char::from_digit(minute % 10, 10).unwrap();
+        [h_tens, h_ones, ':', m_tens, m_ones]
     }
 
     /// Whether an AM/PM indicator should be shown alongside the clock.
