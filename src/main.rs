@@ -203,20 +203,37 @@ impl App {
     /// fixed on-screen card/slot layout. Called whenever the surface size
     /// is (re)established.
     fn layout(&mut self) {
-        let size = self.height as f32 * 0.32;
-        self.glyphs.clear();
-        for c in "0123456789".chars() {
-            self.glyphs.insert(c, self.font.rasterize(c, size));
+        // Start from a generous height-based size, then shrink it if that
+        // would overflow the available width — this way it always uses the
+        // largest size that actually fits THIS monitor's aspect ratio,
+        // rather than a single fixed ratio that's oversized on ultrawide
+        // screens and overflows on standard 16:9/16:10 ones.
+        let mut size = self.height as f32 * 0.44;
+        for _ in 0..2 {
+            self.glyphs.clear();
+            for c in "0123456789".chars() {
+                self.glyphs.insert(c, self.font.rasterize(c, size));
+            }
+            let digit_width = self.glyphs[&'0'].0.advance_width;
+            let card_width = 2.0 * digit_width + size * 0.02 + 2.0 * (size * 0.20);
+            let total_width = 2.0 * card_width + size * 0.42;
+
+            let max_width = self.width as f32 * 0.94;
+            if total_width > max_width {
+                size *= max_width / total_width;
+            } else {
+                break;
+            }
         }
 
         let digit = &self.glyphs[&'0'].0;
         let digit_width = digit.advance_width;
         let glyph_height = digit.height as f32;
 
-        let card_padding_x = size * 0.28;
-        let card_padding_y = size * 0.16;
+        let card_padding_x = size * 0.20;
+        let card_padding_y = size * 0.14;
         let digit_gap = size * 0.02;
-        let pair_gap = size * 0.55;
+        let pair_gap = size * 0.42;
 
         let card_width = 2.0 * digit_width + digit_gap + 2.0 * card_padding_x;
         let half_card_height = (glyph_height / 2.0 + card_padding_y).round() as i32;
