@@ -1,7 +1,8 @@
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData},
     delegate_registry,
     output::{OutputHandler, OutputState},
     reexports::{
@@ -29,8 +30,11 @@ use wayland_client::{
 };
 
 // The font used to draw the clock digits. Loaded from the system for now;
-// we'll bundle our own font file once we get to the flip-card look.
+// we'll bundle our own font file once we get to the final flip-card look.
 const FONT_PATH: &str = "/usr/share/fonts/noto/NotoSans-Bold.ttf";
+
+// How long a single digit's flip animation takes, start to finish.
+const FLIP_DURATION: Duration = Duration::from_millis(350);
 
 fn main() {
     let conn = Connection::connect_to_env().expect("failed to connect to Wayland compositor");
@@ -55,16 +59,14 @@ fn main() {
     let font = fontdue::Font::from_bytes(font_bytes, fontdue::FontSettings::default())
         .expect("failed to parse font");
 
-    // The event loop that will drive us: it can wait on the Wayland socket
-    // AND a timer at the same time, waking us up whenever either has
-    // something to do.
     let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("failed to create event loop");
     let loop_handle = event_loop.handle();
 
-    // Register the Wayland connection as a source the event loop watches.
     WaylandSource::new(conn.clone(), event_queue)
         .insert(loop_handle.clone())
         .expect("failed to insert wayland source");
+
+    let now_chars: Vec<char> = chrono::Local::now().format("%H:%M").to_string().chars().collect();
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -72,19 +74,34 @@ fn main() {
         shm,
         pool,
         layer,
+        qh: qh.clone(),
         font,
         width: 0,
         height: 0,
         first_configure: true,
         exit: false,
+        animating: false,
+        glyphs: HashMap::new(),
+        slot_x: [0.0; 5],
+        baseline: 0.0,
+        hinge_y: 0,
+        slots: std::array::from_fn(|i| DigitSlot { current: now_chars[i], anim: None }),
     };
 
-    // A timer that fires once immediately, then reschedules itself every
-    // second, redrawing the clock each time.
+    // The timer's only job is a coarse poll for "did the clock value
+    // change" while idle. Once a flip starts, redraw pacing hands off
+    // entirely to frame callbacks (see CompositorHandler::frame below) —
+    // the correct Wayland way to animate, since it only draws exactly as
+    // often as the compositor is ready to show a new frame.
     loop_handle
         .insert_source(Timer::immediate(), |_deadline, _, app| {
-            app.redraw_if_ready();
-            TimeoutAction::ToDuration(Duration::from_secs(1))
+            // Guard against firing before the first `configure` event has
+            // arrived (width/height still 0, glyph cache still empty).
+            if app.width > 0 && app.height > 0 && !app.animating {
+                app.advance();
+                app.draw();
+            }
+            TimeoutAction::ToDuration(Duration::from_millis(300))
         })
         .expect("failed to insert timer");
 
@@ -96,24 +113,98 @@ fn main() {
     }
 }
 
+/// One of the 5 character positions on screen (H, H, :, M, M).
+struct DigitSlot {
+    /// The value currently considered "settled" (fully shown, no longer
+    /// animating either way).
+    current: char,
+    /// Set while a flip from `current` to the new value is in progress.
+    anim: Option<(char, Instant)>, // (new value, animation start time)
+}
+
 struct App {
     registry_state: RegistryState,
     output_state: OutputState,
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
+    qh: QueueHandle<App>,
     font: fontdue::Font,
     width: u32,
     height: u32,
     first_configure: bool,
     exit: bool,
+    // True while any digit slot is mid-flip. While true, redraws are paced
+    // by frame callbacks instead of the idle-poll timer.
+    animating: bool,
+
+    // Cache of rasterized glyphs for '0'..'9' and ':', keyed by character,
+    // computed once per screen size instead of every frame.
+    glyphs: HashMap<char, (fontdue::Metrics, Vec<u8>)>,
+    // Precomputed, fixed x position for each of the 5 character slots, so
+    // digits don't jitter horizontally as they change width.
+    slot_x: [f32; 5],
+    baseline: f32,
+    hinge_y: i32,
+
+    slots: [DigitSlot; 5],
 }
 
 impl App {
-    fn redraw_if_ready(&mut self) {
-        if self.width > 0 && self.height > 0 {
-            self.draw();
+    /// Rasterizes and caches every glyph we'll ever need, and computes the
+    /// fixed on-screen slot layout. Called whenever the surface size is
+    /// (re)established.
+    fn layout(&mut self) {
+        let size = self.height as f32 * 0.35;
+        self.glyphs.clear();
+        for c in "0123456789:".chars() {
+            self.glyphs.insert(c, self.font.rasterize(c, size));
         }
+
+        let digit_width = self.glyphs[&'0'].0.advance_width;
+        let colon_width = self.glyphs[&':'].0.advance_width;
+        let total_width = digit_width * 4.0 + colon_width;
+        let start_x = (self.width as f32 - total_width) / 2.0;
+
+        self.slot_x[0] = start_x;
+        self.slot_x[1] = self.slot_x[0] + digit_width;
+        self.slot_x[2] = self.slot_x[1] + digit_width;
+        self.slot_x[3] = self.slot_x[2] + colon_width;
+        self.slot_x[4] = self.slot_x[3] + digit_width;
+
+        self.baseline = self.height as f32 / 2.0 + size / 3.0;
+        self.hinge_y = self.height as i32 / 2;
+    }
+
+    /// Checks the real clock and starts/advances/settles any flip
+    /// animations. Pure state update — does not draw. Updates
+    /// `self.animating` to reflect whether anything is still mid-flip.
+    fn advance(&mut self) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+
+        let now_str = chrono::Local::now().format("%H:%M").to_string();
+        let now_chars: Vec<char> = now_str.chars().collect();
+
+        let mut animating = false;
+        for i in 0..5 {
+            if let Some((new_ch, start)) = self.slots[i].anim {
+                let progress = start.elapsed().as_secs_f32() / FLIP_DURATION.as_secs_f32();
+                if progress >= 1.0 {
+                    self.slots[i].current = new_ch;
+                    self.slots[i].anim = None;
+                } else {
+                    animating = true;
+                }
+            }
+            if self.slots[i].anim.is_none() && self.slots[i].current != now_chars[i] {
+                self.slots[i].anim = Some((now_chars[i], Instant::now()));
+                animating = true;
+            }
+        }
+
+        self.animating = animating;
     }
 
     fn draw(&mut self) {
@@ -125,62 +216,161 @@ impl App {
             .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
             .expect("create buffer");
 
-        // Fill every pixel with opaque black (ARGB byte order = B,G,R,A).
         canvas.chunks_exact_mut(4).for_each(|pixel| {
             pixel.copy_from_slice(&[0x00, 0x00, 0x00, 0xFF]);
         });
 
-        let text = chrono::Local::now().format("%H:%M").to_string();
-        draw_text(canvas, width, height, &self.font, &text);
+        for i in 0..5 {
+            let pen_x = self.slot_x[i];
+            let slot = &self.slots[i];
+
+            match slot.anim {
+                None => {
+                    let (m, b) = &self.glyphs[&slot.current];
+                    draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Top, 1.0);
+                    draw_glyph_half(canvas, width, height, pen_x, self.baseline, m, b, self.hinge_y, Half::Bottom, 1.0);
+                }
+                Some((new_ch, start)) => {
+                    let progress = (start.elapsed().as_secs_f32() / FLIP_DURATION.as_secs_f32()).min(1.0);
+                    let old_ch = slot.current;
+                    let (old_m, old_b) = &self.glyphs[&old_ch];
+                    let (new_m, new_b) = &self.glyphs[&new_ch];
+
+                    if progress < 0.5 {
+                        let q = progress / 0.5;
+                        // New top revealed underneath as the old top shrinks away.
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Top, 1.0);
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Top, 1.0 - q);
+                        // Bottom hasn't started changing yet.
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0);
+                    } else {
+                        let q = (progress - 0.5) / 0.5;
+                        // Top settled onto its new value already.
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Top, 1.0);
+                        // New bottom grows in from the hinge, covering the old one.
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, old_m, old_b, self.hinge_y, Half::Bottom, 1.0);
+                        draw_glyph_half(canvas, width, height, pen_x, self.baseline, new_m, new_b, self.hinge_y, Half::Bottom, q);
+                    }
+                }
+            }
+        }
+
+        // The hinge line running across every card, for the "flip card" look.
+        for x in 0..width {
+            let idx = (self.hinge_y as u32 * width + x) as usize * 4;
+            canvas[idx] = 0x18;
+            canvas[idx + 1] = 0x18;
+            canvas[idx + 2] = 0x18;
+            canvas[idx + 3] = 0xFF;
+        }
 
         self.layer.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
         buffer.attach_to(self.layer.wl_surface()).expect("attach buffer");
+
+        // If still animating, ask for another frame callback BEFORE
+        // committing, so the request rides along in this same commit
+        // instead of sitting unsent until some later commit (wl_surface's
+        // pending `frame` request only actually reaches the compositor on
+        // the next commit — requesting it after committing is a no-op
+        // until something else commits again, which never happens if
+        // nothing else is driving redraws).
+        if self.animating {
+            let surface = self.layer.wl_surface();
+            surface.frame(&self.qh, FrameCallbackData(surface.clone()));
+        }
+
         self.layer.commit();
     }
 }
 
-/// Rasterizes `text` with fontdue and blits it, centered, in white onto
-/// `canvas` (an ARGB8888 buffer of size width*height*4 bytes).
-fn draw_text(canvas: &mut [u8], width: u32, height: u32, font: &fontdue::Font, text: &str) {
-    let size = height as f32 * 0.35;
+#[derive(Clone, Copy, PartialEq)]
+enum Half {
+    Top,
+    Bottom,
+}
 
-    // First pass: rasterize every glyph and measure total width, so we can
-    // center the whole string horizontally.
-    let glyphs: Vec<(fontdue::Metrics, Vec<u8>)> =
-        text.chars().map(|c| font.rasterize(c, size)).collect();
+/// Draws one half (top or bottom, split at `hinge_y`) of a rasterized
+/// glyph, squished vertically by `scale` (1.0 = full size, 0.0 = collapsed
+/// to nothing) and anchored at the hinge line. This is the 2D stand-in for
+/// a card rotating around its hinge in 3D: shrinking a flat half toward its
+/// fixed edge reads as it rotating away edge-on.
+#[allow(clippy::too_many_arguments)]
+fn draw_glyph_half(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    pen_x: f32,
+    baseline: f32,
+    metrics: &fontdue::Metrics,
+    bitmap: &[u8],
+    hinge_y: i32,
+    half: Half,
+    scale: f32,
+) {
+    if scale <= 0.0 || metrics.width == 0 || metrics.height == 0 {
+        return;
+    }
 
-    let total_width: f32 = glyphs.iter().map(|(m, _)| m.advance_width).sum();
-    let mut pen_x = (width as f32 - total_width) / 2.0;
-    let baseline = height as f32 / 2.0 + size / 3.0;
+    // Canvas y where bitmap row 0 would land, if drawn unscaled.
+    let glyph_top = baseline as i32 - metrics.ymin - metrics.height as i32;
+    let hinge_row = (hinge_y - glyph_top) as f32;
 
-    for (metrics, bitmap) in &glyphs {
-        for y in 0..metrics.height {
-            for x in 0..metrics.width {
-                let coverage = bitmap[y * metrics.width + x];
-                if coverage == 0 {
-                    continue;
-                }
-                let px = pen_x as i32 + metrics.xmin + x as i32;
-                let py = baseline as i32 - metrics.ymin - metrics.height as i32 + y as i32;
-                if px < 0 || py < 0 || px as u32 >= width || py as u32 >= height {
-                    continue;
-                }
-                let idx = (py as u32 * width + px as u32) as usize * 4;
-                // White text: just set B, G, R to the glyph's coverage value.
-                canvas[idx] = coverage;
-                canvas[idx + 1] = coverage;
-                canvas[idx + 2] = coverage;
-                canvas[idx + 3] = 0xFF;
-            }
+    let (src_start, src_end) = match half {
+        Half::Top => (0.0, hinge_row.clamp(0.0, metrics.height as f32)),
+        Half::Bottom => (hinge_row.clamp(0.0, metrics.height as f32), metrics.height as f32),
+    };
+    let src_span = (src_end - src_start).max(0.0);
+    if src_span <= 0.0 {
+        return;
+    }
+    let out_span = (src_span * scale).ceil() as i32;
+
+    for out_row in 0..out_span {
+        let (canvas_y, src_row_f) = match half {
+            // Anchored at its bottom edge (the hinge); grows upward.
+            Half::Top => (hinge_y - 1 - out_row, src_end - 1.0 - out_row as f32 / scale),
+            // Anchored at its top edge (the hinge); grows downward.
+            Half::Bottom => (hinge_y + out_row, src_start + out_row as f32 / scale),
+        };
+        if canvas_y < 0 || canvas_y as u32 >= height {
+            continue;
         }
-        pen_x += metrics.advance_width;
+        let src_row = src_row_f.round() as i32;
+        if src_row < 0 || src_row as u32 >= metrics.height as u32 {
+            continue;
+        }
+
+        for x in 0..metrics.width {
+            let coverage = bitmap[src_row as usize * metrics.width + x];
+            if coverage == 0 {
+                continue;
+            }
+            let px = pen_x as i32 + metrics.xmin + x as i32;
+            if px < 0 || px as u32 >= width {
+                continue;
+            }
+            let idx = (canvas_y as u32 * width + px as u32) as usize * 4;
+            canvas[idx] = coverage;
+            canvas[idx + 1] = coverage;
+            canvas[idx + 2] = coverage;
+            canvas[idx + 3] = 0xFF;
+        }
     }
 }
 
 impl CompositorHandler for App {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
+        // The compositor is ready for a new frame. If we're mid-flip,
+        // advance the animation and redraw — draw() itself will ask for
+        // another frame callback if still animating afterward, keeping
+        // this loop going at the compositor's own pace.
+        if self.animating {
+            self.advance();
+            self.draw();
+        }
+    }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
@@ -209,6 +399,7 @@ impl LayerShellHandler for App {
     ) {
         self.width = configure.new_size.0;
         self.height = configure.new_size.1;
+        self.layout();
         if self.first_configure {
             self.first_configure = false;
             self.draw();
