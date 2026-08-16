@@ -45,6 +45,16 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/Inter-ExtraBold.ttf");
 // How long a single digit's flip animation takes, start to finish.
 const FLIP_DURATION: Duration = Duration::from_millis(350);
 
+// Inter's natural digit proportions are too WIDE relative to their height
+// to let the clock get big on a standard 16:9 monitor — 4 digits at full
+// width hit the screen's width limit long before using much of its
+// height. Real Fliqlo's numerals are visibly condensed (tall, narrow).
+// Squeezing horizontally during rendering (not swapping fonts) gets the
+// same effect: less width per digit means `size` can grow much larger
+// before hitting the width ceiling, which grows the height too since
+// they're both derived from the same `size`.
+const DIGIT_SQUEEZE: f32 = 0.62;
+
 // Index into the formatted "HH:MM" time string for each of our 4 digit
 // slots (H, H, M, M) — index 2 (the ':') is skipped since it's drawn
 // separately as two static dots, not a digit slot.
@@ -208,17 +218,17 @@ impl App {
         // largest size that actually fits THIS monitor's aspect ratio,
         // rather than a single fixed ratio that's oversized on ultrawide
         // screens and overflows on standard 16:9/16:10 ones.
-        let mut size = self.height as f32 * 0.85;
+        let mut size = self.height as f32 * 1.3;
         for _ in 0..2 {
             self.glyphs.clear();
             for c in "0123456789".chars() {
                 self.glyphs.insert(c, self.font.rasterize(c, size));
             }
-            let digit_width = self.glyphs[&'0'].0.advance_width;
-            let card_width = 2.0 * digit_width + size * 0.02 + 2.0 * (size * 0.08);
-            let total_width = 2.0 * card_width + size * 0.35;
+            let digit_width = self.glyphs[&'0'].0.advance_width * DIGIT_SQUEEZE;
+            let card_width = 2.0 * digit_width + size * 0.02 + 2.0 * (size * 0.04);
+            let total_width = 2.0 * card_width + size * 0.15;
 
-            let max_width = self.width as f32 * 0.97;
+            let max_width = self.width as f32 * 0.98;
             if total_width > max_width {
                 size *= max_width / total_width;
             } else {
@@ -227,13 +237,13 @@ impl App {
         }
 
         let digit = &self.glyphs[&'0'].0;
-        let digit_width = digit.advance_width;
+        let digit_width = digit.advance_width * DIGIT_SQUEEZE;
         let glyph_height = digit.height as f32;
 
-        let card_padding_x = size * 0.08;
+        let card_padding_x = size * 0.04;
         let card_padding_y = size * 0.05;
         let digit_gap = size * 0.02;
-        let pair_gap = size * 0.35;
+        let pair_gap = size * 0.15;
 
         let card_width = 2.0 * digit_width + digit_gap + 2.0 * card_padding_x;
         let half_card_height = (glyph_height / 2.0 + card_padding_y).round() as i32;
@@ -521,12 +531,21 @@ fn draw_glyph_half(
             continue;
         }
 
-        for x in 0..metrics.width {
-            let coverage = bitmap[src_row as usize * metrics.width + x];
+        // Condense horizontally: walk OUTPUT columns (narrower than the
+        // source glyph by DIGIT_SQUEEZE) and sample back into the source
+        // bitmap, same nearest-neighbor idea as the vertical flip scaling
+        // above, just applied on every draw instead of only during a flip.
+        let squeezed_width = ((metrics.width as f32) * DIGIT_SQUEEZE).ceil() as i32;
+        for ox in 0..squeezed_width {
+            let src_x = (ox as f32 / DIGIT_SQUEEZE).round() as usize;
+            if src_x >= metrics.width {
+                continue;
+            }
+            let coverage = bitmap[src_row as usize * metrics.width + src_x];
             if coverage == 0 {
                 continue;
             }
-            let px = pen_x as i32 + metrics.xmin + x as i32;
+            let px = pen_x as i32 + (metrics.xmin as f32 * DIGIT_SQUEEZE).round() as i32 + ox;
             if px < 0 || px as u32 >= width {
                 continue;
             }
